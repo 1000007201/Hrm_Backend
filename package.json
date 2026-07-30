@@ -1,0 +1,48 @@
+{
+  "name": "hrm_backend",
+  "version": "1.0.0",
+  "description": "HRM SaaS backend — Fastify, TypeScript, Prisma, PostgreSQL, Better Auth",
+  "main": "dist/index.js",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "npm run db:generate && tsc",
+    "start": "node dist/index.js",
+    "typecheck": "tsc --noEmit",
+    "db:migrate": "prisma migrate dev",
+    "db:generate": "prisma generate",
+    "auth:generate": "npx auth@latest generate -y",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/1000007201/HRM_Backend.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "bugs": {
+    "url": "https://github.com/1000007201/HRM_Backend/issues"
+  },
+  "homepage": "https://github.com/1000007201/HRM_Backend#readme",
+  "dependencies": {
+    "@fastify/cors": "^11.3.0",
+    "@prisma/adapter-pg": "^7.9.1",
+    "@prisma/client": "^7.9.1",
+    "better-auth": "^1.6.25",
+    "dotenv": "^17.4.2",
+    "fastify": "^5.10.0",
+    "fastify-plugin": "^6.0.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.2",
+    "pino-pretty": "^13.1.3",
+    "prisma": "^7.9.1",
+    "tsx": "^4.23.1",
+    "typescript": "^7.0.2"
+  }
+}

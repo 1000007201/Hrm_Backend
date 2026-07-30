@@ -1,3 +1,6 @@
+# Prisma generated client (recreated by `npm run build` / postinstall)
+src/generated/
+
 # Logs
 logs
 *.log
