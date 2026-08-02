@@ -10,6 +10,7 @@
     "typecheck": "tsc --noEmit",
     "db:migrate": "prisma migrate dev",
     "db:generate": "prisma generate",
+    "db:seed": "tsx prisma/seed.ts",
     "auth:generate": "npx auth@latest generate -y",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
@@ -36,6 +37,7 @@
     "dotenv": "^17.4.2",
     "fastify": "^5.10.0",
     "fastify-plugin": "^6.0.0",
+    "resend": "^6.18.1",
     "zod": "^4.4.3"
   },
   "devDependencies": {

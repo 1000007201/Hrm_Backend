@@ -37,6 +37,7 @@ npm run db:migrate
 | `npm run typecheck` | Type check without emitting |
 | `npm run db:migrate` | Create + apply a migration (dev) |
 | `npm run db:generate` | Regenerate the Prisma client |
+| `npm run db:seed` | Create a demo company + ADMIN via `prisma/seed.ts` (safe to re-run) |
 | `npm run auth:generate` | Regenerate Better Auth's Prisma models into `prisma/schema.prisma` |
 
 ## Environment
@@ -51,6 +52,11 @@ All variables are validated at startup by [src/env.ts](src/env.ts); the process 
 | `BETTER_AUTH_SECRET` | — | Required, min 32 chars. Generate with `openssl rand -base64 32` |
 | `BETTER_AUTH_URL` | — | Required, this API's own base URL |
 | `FRONTEND_ORIGIN` | — | Required, the single trusted frontend origin (used for CORS + Better Auth's `trustedOrigins`) |
+| `RESEND_API_KEY` | unset | [Resend](https://resend.com) API key. Unset in dev → emails are logged to the console instead of sent (see below) |
+| `EMAIL_FROM` | `onboarding@resend.dev` | "From" address for outgoing email |
+| `REQUIRE_EMAIL_VERIFICATION` | `false` | Gates sign-in on a verified email. See "Turning on email verification" below |
+| `ENABLE_PUBLIC_SIGNUP` | `false` | Opens `POST /api/register-company` to the public. While `false`, callers must send `REGISTRATION_SECRET` as an `X-Registration-Secret` header |
+| `REGISTRATION_SECRET` | unset | Shared secret gating company registration (min 16 chars). Generate with `openssl rand -base64 32`. Irrelevant once `ENABLE_PUBLIC_SIGNUP=true` |
 
 ## Layout
 
@@ -60,10 +66,14 @@ prisma.config.ts           Prisma 7 CLI config (migration datasource)
 src/env.ts                 Zod-validated environment, fails fast at boot
 src/lib/prisma.ts          PrismaClient singleton (globalThis-cached in dev) + pg driver adapter
 src/lib/auth.ts            Better Auth config: Prisma adapter, organization + openAPI plugins
+src/lib/email.ts           sendEmail() — Resend, console fallback in dev
+src/lib/registerCompany.ts Shared tenant-bootstrap logic: User -> Organization -> owner Member -> ADMIN Employee -> active org
 src/plugins/auth.ts        Mounts Better Auth's handler at /api/auth/*, decorates request.getSession()
 src/routes/health.ts       GET /health, GET /health/db, GET /me
+src/routes/registerCompany.ts  POST /api/register-company
 src/server.ts              App factory: builds the Fastify instance, registers cors/plugins/routes
 src/index.ts                Boots: validates env, builds the app, listens, handles graceful shutdown
+prisma/seed.ts              Demo company + ADMIN via registerCompany(), idempotent
 ```
 
 ## Data model
@@ -81,6 +91,82 @@ Because the Better Auth CLI overwrites `prisma/schema.prisma` wholesale on each 
 | GET | `/health/db` | Runs `SELECT 1` against Postgres |
 | GET/POST | `/api/auth/*` | Better Auth (sign-up, sign-in, session, organization endpoints, etc.) |
 | GET | `/me` | 401 without a session; otherwise the user + `activeOrganizationId` |
+| POST | `/api/register-company` | Bootstraps a new tenant — see "Registering a company" below |
+
+## Email & password reset
+
+`src/lib/email.ts` wraps [Resend](https://resend.com) behind a single `sendEmail({ to, subject, html })`
+function — nothing else in the codebase should call the Resend SDK directly.
+`src/lib/auth.ts` uses it for Better Auth's `sendResetPassword` and
+`sendVerificationEmail` hooks.
+
+**Testing the reset flow locally** (no Resend account needed): leave
+`RESEND_API_KEY` unset in `.env`. `POST /api/auth/request-password-reset`
+with a known email will log the reset link (with token) to the console
+instead of sending it — copy that link and call
+`POST /api/auth/reset-password` with the token and new password. Password
+reset tokens expire after 1 hour and revoke all existing sessions for that
+user on success.
+
+**Turning on email verification**: set `REQUIRE_EMAIL_VERIFICATION=true` in
+`.env`. This blocks sign-in for unverified users and starts sending
+verification emails through the same `sendEmail` path — no code change
+needed, just the env var (the frontend also needs a page to land users on
+after they click the verification link, which is out of scope here).
+
+**Rate limiting** on auth endpoints is handled by Better Auth's built-in
+limiter (see the comment in `src/lib/auth.ts`) rather than a separate
+package — it already ships tighter windows for sign-in/sign-up and
+password-reset/verification requests than its general default.
+
+## Registering a company
+
+`POST /api/register-company` bootstraps a new tenant: it creates the Better
+Auth `User`, the `Organization`, an `owner` `Member`, the domain `Employee`
+(`role: ADMIN`), and sets that organization active on the new session — all
+via the shared `registerCompany()` helper in `src/lib/registerCompany.ts` (also
+used by the seed script). Employees themselves are invite-only and are not
+created by this endpoint; it only exists to create the *first* admin for a
+brand-new company.
+
+Body: `{ companyName, fullName, email, password }` (password same policy as
+sign-up: 10–128 chars). Response: `{ user, organization }`, plus a `Set-Cookie`
+for the new session — no token or password is ever returned in the body.
+
+While `ENABLE_PUBLIC_SIGNUP=false` (the default), the endpoint requires an
+`X-Registration-Secret` header matching `REGISTRATION_SECRET`:
+
+```bash
+curl -X POST http://localhost:4000/api/register-company \
+  -H "Content-Type: application/json" \
+  -H "X-Registration-Secret: $REGISTRATION_SECRET" \
+  -d '{"companyName":"Acme Inc","fullName":"Ada Admin","email":"ada@acme.test","password":"supersecret123"}'
+```
+
+Signed-in users cannot self-service create additional organizations through
+Better Auth's own `/api/auth/organization/create` endpoint
+(`allowUserToCreateOrganization: false` in `src/lib/auth.ts`) — this endpoint
+is the only path that creates an org, because it's the only path that also
+creates the required `Employee` row.
+
+If `registerCompany()` fails after the `User`/`Organization` already exist
+(e.g. `Employee` creation fails), it best-effort deletes both and logs loudly
+if that cleanup itself fails — check server logs for `ORPHAN LEFT BEHIND` if a
+registration ever 500s.
+
+## Seeding a demo company
+
+```bash
+npm run db:seed
+```
+
+Runs the same bootstrap as above with fixed demo values (override via
+`DEMO_COMPANY_NAME` / `DEMO_ADMIN_NAME` / `DEMO_ADMIN_EMAIL` /
+`DEMO_ADMIN_PASSWORD` env vars — these aren't part of `src/env.ts` since
+they're seed-only, not needed for the app to boot). Safe to run repeatedly:
+it checks for the demo admin's email first and skips if found. Also runs
+automatically after `prisma migrate dev` (wired via `migrations.seed` in
+`prisma.config.ts`), or on demand with `npx prisma db seed`.
 
 ## Notes
 
