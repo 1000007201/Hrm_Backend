@@ -1,9 +1,30 @@
 import { betterAuth } from "better-auth";
 import { prismaAdapter } from "better-auth/adapters/prisma";
 import { organization, openAPI } from "better-auth/plugins";
+import { defaultAc, defaultRoles } from "better-auth/plugins/organization/access";
 import { prisma } from "./prisma.js";
 import { sendEmail } from "./email.js";
+import { linkEmployeeOnAcceptInvitation, getInvitationAcceptUrl } from "./invitations.js";
 import { env } from "../env.js";
+
+// Org roles mirroring EmployeeRole (ADMIN/HR/MANAGER/EMPLOYEE, lowercased —
+// see toOrgRole in invitations.ts). "owner" is Better Auth's own built-in
+// role and stays as-is for whoever registers the company; these four are
+// what an invited employee's org membership carries. Only admin/hr get
+// invitation permissions — matches the ADMIN/HR-only gate on the invite
+// routes, so Better Auth's own permission check agrees with ours.
+const adminOrgRole = defaultAc.newRole({
+  organization: ["update"],
+  member: ["create", "update", "delete"],
+  invitation: ["create", "cancel"],
+  team: ["create", "update", "delete"],
+  ac: ["create", "read", "update", "delete"],
+});
+const hrOrgRole = defaultAc.newRole({
+  invitation: ["create", "cancel"],
+});
+const managerOrgRole = defaultAc.newRole({});
+const employeeOrgRole = defaultAc.newRole({});
 
 export const auth = betterAuth({
   secret: env.BETTER_AUTH_SECRET,
@@ -64,6 +85,36 @@ export const auth = betterAuth({
       // creating additional orgs via Better Auth's own client-facing
       // endpoint (which wouldn't create the domain Employee row).
       allowUserToCreateOrganization: false,
+      // hasPermission resolves roles via `options.roles || defaultRoles` —
+      // NOT a merge — so setting `roles` at all replaces the built-ins
+      // entirely unless we spread them back in. Without this, "owner"
+      // silently loses every permission (including inviting) the moment a
+      // custom roles map is set.
+      roles: {
+        ...defaultRoles,
+        admin: adminOrgRole,
+        hr: hrOrgRole,
+        manager: managerOrgRole,
+        employee: employeeOrgRole,
+      },
+      invitationExpiresIn: 60 * 60 * 24 * 7, // 7 days
+      cancelPendingInvitationsOnReInvite: true,
+      sendInvitationEmail: async ({ id, email, organization: org, inviter }) => {
+        const url = getInvitationAcceptUrl(id);
+        void sendEmail({
+          to: email,
+          subject: `You're invited to join ${org.name}`,
+          html: `<p>${inviter.user.name} invited you to join <strong>${org.name}</strong>.</p><p><a href="${url}">${url}</a></p><p>This invitation expires in 7 days.</p>`,
+        });
+      },
+      organizationHooks: {
+        // The crux of the invite flow: link the accepting user to the
+        // pre-existing Employee record (by org + email) instead of ever
+        // creating a second one. See src/lib/invitations.ts.
+        afterAcceptInvitation: async (data) => {
+          await linkEmployeeOnAcceptInvitation(data);
+        },
+      },
     }),
     openAPI(),
   ],

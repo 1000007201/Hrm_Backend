@@ -4,6 +4,8 @@ import { env, isProduction } from "./env.js";
 import authPlugin from "./plugins/auth.js";
 import { healthRoutes } from "./routes/health.js";
 import { registerCompanyRoutes } from "./routes/registerCompany.js";
+import { employeeRoutes } from "./routes/employees.js";
+import { invitationRoutes } from "./routes/invitations.js";
 
 export const buildApp = (): FastifyInstance => {
   const app = Fastify({
@@ -25,6 +27,8 @@ export const buildApp = (): FastifyInstance => {
   app.register(authPlugin);
   app.register(healthRoutes);
   app.register(registerCompanyRoutes);
+  app.register(employeeRoutes);
+  app.register(invitationRoutes);
 
   return app;
 };

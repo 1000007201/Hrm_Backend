@@ -70,7 +70,7 @@ export const registerCompany = async ({
 
   try {
     await prisma.employee.create({
-      data: { userId: user.id, organizationId: organization.id, fullName, role: "ADMIN" },
+      data: { userId: user.id, organizationId: organization.id, fullName, email: user.email, role: "ADMIN" },
     });
   } catch (err) {
     console.error(
