@@ -21,6 +21,9 @@ const envSchema = z.object({
     .default("false")
     .transform((value) => value === "true"),
   REGISTRATION_SECRET: z.string().min(16).optional(),
+  ACCRUAL_SECRET: z
+    .string()
+    .min(16, "ACCRUAL_SECRET must be at least 16 characters"),
 });
 
 const parsed = envSchema.safeParse(process.env);

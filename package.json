@@ -12,7 +12,7 @@
     "db:generate": "prisma generate",
     "db:seed": "tsx prisma/seed.ts",
     "auth:generate": "npx auth@latest generate -y",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "node --import tsx --test src/**/*.test.ts"
   },
   "repository": {
     "type": "git",

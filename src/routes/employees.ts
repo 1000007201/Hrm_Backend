@@ -1,9 +1,23 @@
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { prisma } from "../lib/prisma.js";
-import { authorizeEmployeeManager, isAuthError } from "../lib/authorizeEmployeeManager.js";
+import { EmployeeRole } from "../generated/prisma/client.js";
+import { AppError } from "../lib/errors.js";
+import { ok } from "../lib/response.js";
+import { buildOrgChartTree } from "../lib/orgChart.js";
 
 const managerSelect = { manager: { select: { id: true, fullName: true } } } as const;
+const MANAGER_ROLES = [EmployeeRole.ADMIN, EmployeeRole.HR];
+
+// Lightweight, non-sensitive projection used by both org-chart endpoints —
+// no email, no organizationId, nothing beyond what's needed to render a tree.
+const lightweightEmployeeSelect = {
+  id: true,
+  fullName: true,
+  role: true,
+  designation: true,
+  userId: true,
+} as const;
 
 const creatableRoleSchema = z.enum(["HR", "MANAGER", "EMPLOYEE"]);
 const emailSchema = z.email().trim().toLowerCase();
@@ -31,133 +45,66 @@ const listQuerySchema = z.object({
   pageSize: z.coerce.number().int().positive().max(100).default(20),
 });
 
-// managerId must reference an existing Employee in the same org; returns a
-// 400-shaped error string on failure, or null when it's fine to proceed.
-const validateManagerId = async (
-  managerId: string,
-  organizationId: string,
-  selfId?: string,
-): Promise<string | null> => {
+// managerId must reference an existing Employee in the same org — not
+// something a DB constraint can enforce (the FK is to Employee.id globally),
+// so it stays a manual check. Throws AppError on failure.
+const validateManagerId = async (managerId: string, organizationId: string, selfId?: string): Promise<void> => {
   if (managerId === selfId) {
-    return "An employee cannot be their own manager";
+    throw new AppError(400, "VALIDATION", "An employee cannot be their own manager");
   }
   const manager = await prisma.employee.findFirst({ where: { id: managerId, organizationId } });
   if (!manager) {
-    return "managerId must reference an employee in your organization";
+    throw new AppError(400, "VALIDATION", "managerId must reference an employee in your organization");
   }
-  return null;
 };
 
 export const employeeRoutes = async (app: FastifyInstance) => {
-  app.post("/api/employees", async (request, reply) => {
-    const auth = await authorizeEmployeeManager(request);
-    if (isAuthError(auth)) {
-      reply.status(auth.status);
-      return { error: auth.error };
-    }
-
-    const parsed = createEmployeeSchema.safeParse(request.body);
-    if (!parsed.success) {
-      reply.status(400);
-      return { error: z.prettifyError(parsed.error) };
-    }
-    const { fullName, email, role, designation, managerId } = parsed.data;
-    const { organizationId } = auth;
+  app.post("/api/employees", { preHandler: app.requireRole(MANAGER_ROLES) }, async (request, reply) => {
+    const { fullName, email, role, designation, managerId } = createEmployeeSchema.parse(request.body);
+    const { organizationId } = request.auth;
 
     if (managerId) {
-      const managerError = await validateManagerId(managerId, organizationId);
-      if (managerError) {
-        reply.status(400);
-        return { error: managerError };
-      }
+      await validateManagerId(managerId, organizationId);
     }
 
-    const existing = await prisma.employee.findUnique({
-      where: { organizationId_email: { organizationId, email } },
-    });
-    if (existing) {
-      reply.status(409);
-      return { error: "An employee with this email already exists in your organization" };
-    }
-
+    // Duplicate email in-org is caught by the organizationId_email unique
+    // constraint and mapped to 409 CONFLICT centrally — no pre-check needed.
     const employee = await prisma.employee.create({
       data: { organizationId, fullName, email, role, designation, managerId },
       include: managerSelect,
     });
 
     reply.status(201);
-    return { employee };
+    return ok({ employee });
   });
 
-  app.patch("/api/employees/:id", async (request, reply) => {
-    const auth = await authorizeEmployeeManager(request);
-    if (isAuthError(auth)) {
-      reply.status(auth.status);
-      return { error: auth.error };
-    }
-    const { organizationId } = auth;
-
-    const paramsParsed = idParamSchema.safeParse(request.params);
-    if (!paramsParsed.success) {
-      reply.status(400);
-      return { error: z.prettifyError(paramsParsed.error) };
-    }
-    const { id } = paramsParsed.data;
-
-    const bodyParsed = updateEmployeeSchema.safeParse(request.body);
-    if (!bodyParsed.success) {
-      reply.status(400);
-      return { error: z.prettifyError(bodyParsed.error) };
-    }
-    const { managerId, email } = bodyParsed.data;
+  app.patch("/api/employees/:id", { preHandler: app.requireRole(MANAGER_ROLES) }, async (request) => {
+    const { organizationId } = request.auth;
+    const { id } = idParamSchema.parse(request.params);
+    const body = updateEmployeeSchema.parse(request.body);
+    const { managerId } = body;
 
     const existing = await prisma.employee.findFirst({ where: { id, organizationId } });
     if (!existing) {
-      reply.status(404);
-      return { error: "Employee not found" };
+      throw new AppError(404, "NOT_FOUND", "Employee not found");
     }
 
     if (managerId) {
-      const managerError = await validateManagerId(managerId, organizationId, id);
-      if (managerError) {
-        reply.status(400);
-        return { error: managerError };
-      }
-    }
-
-    if (email && email !== existing.email) {
-      const emailOwner = await prisma.employee.findUnique({
-        where: { organizationId_email: { organizationId, email } },
-      });
-      if (emailOwner) {
-        reply.status(409);
-        return { error: "An employee with this email already exists in your organization" };
-      }
+      await validateManagerId(managerId, organizationId, id);
     }
 
     const employee = await prisma.employee.update({
       where: { id },
-      data: bodyParsed.data,
+      data: body,
       include: managerSelect,
     });
 
-    return { employee };
+    return ok({ employee });
   });
 
-  app.get("/api/employees", async (request, reply) => {
-    const auth = await authorizeEmployeeManager(request);
-    if (isAuthError(auth)) {
-      reply.status(auth.status);
-      return { error: auth.error };
-    }
-    const { organizationId } = auth;
-
-    const queryParsed = listQuerySchema.safeParse(request.query);
-    if (!queryParsed.success) {
-      reply.status(400);
-      return { error: z.prettifyError(queryParsed.error) };
-    }
-    const { page, pageSize } = queryParsed.data;
+  app.get("/api/employees", { preHandler: app.requireRole(MANAGER_ROLES) }, async (request) => {
+    const { organizationId } = request.auth;
+    const { page, pageSize } = listQuerySchema.parse(request.query);
 
     const [employees, total] = await Promise.all([
       prisma.employee.findMany({
@@ -170,32 +117,59 @@ export const employeeRoutes = async (app: FastifyInstance) => {
       prisma.employee.count({ where: { organizationId } }),
     ]);
 
-    return { employees, page, pageSize, total };
+    return ok({ employees, page, pageSize, total });
   });
 
-  app.get("/api/employees/:id", async (request, reply) => {
-    const auth = await authorizeEmployeeManager(request);
-    if (isAuthError(auth)) {
-      reply.status(auth.status);
-      return { error: auth.error };
-    }
-    const { organizationId } = auth;
-
-    const paramsParsed = idParamSchema.safeParse(request.params);
-    if (!paramsParsed.success) {
-      reply.status(400);
-      return { error: z.prettifyError(paramsParsed.error) };
-    }
+  app.get("/api/employees/:id", { preHandler: app.requireRole(MANAGER_ROLES) }, async (request) => {
+    const { organizationId } = request.auth;
+    const { id } = idParamSchema.parse(request.params);
 
     const employee = await prisma.employee.findFirst({
-      where: { id: paramsParsed.data.id, organizationId },
+      where: { id, organizationId },
       include: managerSelect,
     });
     if (!employee) {
-      reply.status(404);
-      return { error: "Employee not found" };
+      throw new AppError(404, "NOT_FOUND", "Employee not found");
     }
 
-    return { employee };
+    return ok({ employee });
+  });
+
+  // Any authenticated org member can view the chart — it's read-only and
+  // carries no sensitive fields (no email), unlike the ADMIN/HR-gated CRUD
+  // above.
+  app.get("/api/employees/org-chart", { preHandler: app.requireAuth }, async (request) => {
+    const { organizationId } = request.auth;
+
+    // Single query for the whole org; the tree is assembled in memory by
+    // buildOrgChartTree (src/lib/orgChart.ts) — no per-node recursion into
+    // the DB.
+    const employees = await prisma.employee.findMany({
+      where: { organizationId },
+      select: { ...lightweightEmployeeSelect, managerId: true },
+    });
+
+    const tree = buildOrgChartTree(employees, (message) => request.log.warn(message));
+    return ok({ tree });
+  });
+
+  app.get("/api/employees/:id/reports", { preHandler: app.requireAuth }, async (request) => {
+    const { organizationId } = request.auth;
+    const { id } = idParamSchema.parse(request.params);
+
+    const manager = await prisma.employee.findFirst({ where: { id, organizationId }, select: { id: true } });
+    if (!manager) {
+      throw new AppError(404, "NOT_FOUND", "Employee not found");
+    }
+
+    const reports = await prisma.employee.findMany({
+      where: { organizationId, managerId: id },
+      select: lightweightEmployeeSelect,
+      orderBy: { fullName: "asc" },
+    });
+
+    return ok({
+      reports: reports.map(({ userId, ...employee }) => ({ ...employee, hasPortalAccess: userId !== null })),
+    });
   });
 };

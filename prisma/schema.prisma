@@ -1,4 +1,3 @@
-
 generator client {
   provider = "prisma-client"
   output   = "../src/generated/prisma"
@@ -76,15 +75,17 @@ model Verification {
 }
 
 model Organization {
-  id          String       @id
-  name        String
-  slug        String
-  logo        String?
-  createdAt   DateTime
-  metadata    String?
-  members     Member[]
-  invitations Invitation[]
-  employees   Employee[]
+  id            String         @id
+  name          String
+  slug          String
+  logo          String?
+  createdAt     DateTime
+  metadata      String?
+  members       Member[]
+  invitations   Invitation[]
+  employees     Employee[]
+  leaveTypes    LeaveType[]
+  leaveBalances LeaveBalance[]
 
   @@unique([slug])
   @@map("organization")
@@ -129,8 +130,8 @@ enum EmployeeRole {
 }
 
 model Employee {
-  id             String   @id @default(cuid())
-  userId         String?  @unique
+  id             String  @id @default(cuid())
+  userId         String? @unique
   organizationId String
 
   fullName    String
@@ -138,6 +139,10 @@ model Employee {
   designation String?
   role        EmployeeRole @default(EMPLOYEE)
   invitedAt   DateTime?
+  // Used for leave-accrual eligibility: an employee doesn't accrue for months
+  // before they joined. Nullable — null is treated as "always eligible" (e.g.
+  // existing employees created before this field existed).
+  joiningDate DateTime?
 
   managerId String?
   manager   Employee?  @relation("Reports", fields: [managerId], references: [id])
@@ -149,10 +154,60 @@ model Employee {
   // SetNull (not Cascade): the Employee is an HR record independent of portal
   // login — deleting the linked User account should just revoke login, not
   // erase the HR artifact.
-  user         User?        @relation(fields: [userId], references: [id], onDelete: SetNull)
-  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  user          User?          @relation(fields: [userId], references: [id], onDelete: SetNull)
+  organization  Organization   @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  leaveBalances LeaveBalance[]
 
   @@unique([organizationId, email])
   @@index([organizationId])
   @@index([managerId])
+}
+
+// One row per (org, leave code) — e.g. CL/SL/EL. accrualPerMonth is credited
+// to every eligible employee's balance each month, capped at annualCap for
+// the year (see accrueForOrg in src/lib/leaveAccrual.ts).
+model LeaveType {
+  id              String  @id @default(cuid())
+  organizationId  String
+  name            String
+  code            String
+  accrualPerMonth Decimal @db.Decimal(5, 2)
+  annualCap       Int
+  isPaid          Boolean @default(true)
+  allowHalfDay    Boolean @default(true)
+  isActive        Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  organization Organization   @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  balances     LeaveBalance[]
+
+  @@unique([organizationId, code])
+  @@index([organizationId])
+}
+
+// One row per (employee, leave type, year). Available balance is computed
+// (accruedDays - usedDays), not stored. lastAccruedMonth records the last
+// calendar month (1-12) accrueForOrg applied for this year, so re-running a
+// month is a no-op and a missed month can be applied later.
+model LeaveBalance {
+  id               String  @id @default(cuid())
+  organizationId   String
+  employeeId       String
+  leaveTypeId      String
+  year             Int
+  accruedDays      Decimal @default(0) @db.Decimal(6, 2)
+  usedDays         Decimal @default(0) @db.Decimal(6, 2)
+  lastAccruedMonth Int?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  employee     Employee     @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  leaveType    LeaveType    @relation(fields: [leaveTypeId], references: [id], onDelete: Cascade)
+
+  @@unique([employeeId, leaveTypeId, year])
+  @@index([organizationId])
 }

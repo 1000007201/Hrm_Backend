@@ -39,6 +39,7 @@ npm run db:migrate
 | `npm run db:generate` | Regenerate the Prisma client |
 | `npm run db:seed` | Create a demo company + ADMIN via `prisma/seed.ts` (safe to re-run) |
 | `npm run auth:generate` | Regenerate Better Auth's Prisma models into `prisma/schema.prisma` |
+| `npm test` | Runs `*.test.ts` files via Node's built-in test runner (`node --test`, no framework) |
 
 ## Environment
 
@@ -57,6 +58,7 @@ All variables are validated at startup by [src/env.ts](src/env.ts); the process 
 | `REQUIRE_EMAIL_VERIFICATION` | `false` | Gates sign-in on a verified email. See "Turning on email verification" below |
 | `ENABLE_PUBLIC_SIGNUP` | `false` | Opens `POST /api/register-company` to the public. While `false`, callers must send `REGISTRATION_SECRET` as an `X-Registration-Secret` header |
 | `REGISTRATION_SECRET` | unset | Shared secret gating company registration (min 16 chars). Generate with `openssl rand -base64 32`. Irrelevant once `ENABLE_PUBLIC_SIGNUP=true` |
+| `ACCRUAL_SECRET` | — | Required, min 16 chars. Shared secret gating `POST /system/leave/accrual/run-all` (sent as `X-Accrual-Secret`) — see "Leave: types, balances & accrual" below |
 
 ## Layout
 
@@ -68,12 +70,20 @@ src/lib/prisma.ts          PrismaClient singleton (globalThis-cached in dev) + p
 src/lib/auth.ts            Better Auth config: Prisma adapter, organization + openAPI plugins
 src/lib/email.ts           sendEmail() — Resend, console fallback in dev
 src/lib/registerCompany.ts Shared tenant-bootstrap logic: User -> Organization -> owner Member -> ADMIN Employee -> active org
+src/lib/errors.ts          AppError (statusCode/code/message/details) thrown by routes for known failures
+src/lib/response.ts        ok(data) — wraps a successful payload in the { success: true, data } envelope
+src/lib/orgChart.ts        buildOrgChartTree() — assembles the reporting forest in memory, handles orphans/cycles
+src/lib/leaveTypes.ts      ensureDefaultLeaveTypes() — idempotent CL/SL/EL seeding, called from registerCompany()
+src/lib/leaveAccrual.ts    accrueForOrg() / accrueForAllOrgs() — the monthly accrual engine
 src/plugins/auth.ts        Mounts Better Auth's handler at /api/auth/*, decorates request.getSession()
+src/plugins/authGuard.ts   app.requireAuth / app.requireRole([...]) preHandlers; populate request.auth
+src/plugins/errorHandler.ts  Central setErrorHandler — AppError/zod/Prisma errors -> the { success: false, error } envelope
 src/routes/health.ts       GET /health, GET /health/db, GET /me
 src/routes/registerCompany.ts  POST /api/register-company
-src/routes/employees.ts    Employee CRUD (ADMIN/HR only, tenant-scoped)
+src/routes/employees.ts    Employee CRUD + org chart (ADMIN/HR for CRUD, any org member for reads), tenant-scoped
 src/routes/invitations.ts  Invite/accept-link/list/cancel (ADMIN/HR only, tenant-scoped)
-src/lib/authorizeEmployeeManager.ts  Shared ADMIN/HR + active-org gate for employees.ts and invitations.ts
+src/routes/leave.ts        GET /leave/*, POST /admin/leave/accrual/run — see "Leave: types, balances & accrual" below
+src/routes/systemAccrual.ts  POST /system/leave/accrual/run-all — secret-header gated, no session (cron target)
 src/lib/invitations.ts     EmployeeRole <-> org role mapping, accept-URL builder, link-on-accept logic
 src/server.ts              App factory: builds the Fastify instance, registers cors/plugins/routes
 src/index.ts                Boots: validates env, builds the app, listens, handles graceful shutdown
@@ -95,9 +105,60 @@ prisma/seed.ts              Demo company + ADMIN via registerCompany(), idempote
   `userId` back to `null` (`onDelete: SetNull`, not `Cascade`) rather than
   deleting the HR record, since login and HR record are independent.
   `EmployeeRole` (`ADMIN`, `HR`, `MANAGER`, `EMPLOYEE`) and the `managerId` /
-  `reports` self-relation are unchanged.
+  `reports` self-relation are unchanged. `joiningDate` (nullable) is new —
+  used only for leave-accrual eligibility (see below); `null` is treated as
+  "always eligible" so existing employees aren't blocked from accruing.
+- `LeaveType` — one row per (org, leave code), e.g. `CL`/`SL`/`EL`
+  (`@@unique([organizationId, code])`). `accrualPerMonth` (`Decimal`) is
+  credited monthly up to `annualCap` (days/year). `isPaid`/`allowHalfDay` are
+  metadata for the request/approval flow (not built yet — Prompt 2).
+- `LeaveBalance` — one row per (employee, leave type, year)
+  (`@@unique([employeeId, leaveTypeId, year])`). Stores `accruedDays` and
+  `usedDays` (both `Decimal`, avoids float drift on day amounts);
+  **available balance is computed as `accruedDays - usedDays`, never
+  stored.** `lastAccruedMonth` (1-12) is the last calendar month the accrual
+  engine applied for that year — see "Leave: types, balances & accrual"
+  below.
 
 Because the Better Auth CLI overwrites `prisma/schema.prisma` wholesale on each run, the `Employee` model and the `employee`/`employees` reverse-relation fields on `User`/`Organization` are hand-maintained — re-add them if you ever regenerate and see them missing.
+
+## API response envelope
+
+> **Frontend-breaking change:** every route below except `/api/auth/*` (which
+> stays in Better Auth's native shape) now wraps its response. Update the
+> frontend API wrapper accordingly.
+
+- Success: `{ "success": true, "data": <payload> }`, HTTP status unchanged
+  from before (e.g. `201` on create).
+- Error: `{ "success": false, "error": { "code", "message", "details"? } }`.
+  `code` is one of `VALIDATION | UNAUTHORIZED | FORBIDDEN | NOT_FOUND |
+  CONFLICT | INTERNAL`. `details` is present for `VALIDATION` errors (zod's
+  field-level tree) and omitted otherwise.
+
+Routes throw `AppError(statusCode, code, message, details?)`
+([src/lib/errors.ts](src/lib/errors.ts)) for known failures, or let a zod
+`.parse()` / Prisma error bubble up — a single `setErrorHandler`
+([src/plugins/errorHandler.ts](src/plugins/errorHandler.ts)) turns all three
+into the envelope above. Prisma's `P2002` (unique constraint) becomes `409
+CONFLICT` and `P2025` (not found) becomes `404 NOT_FOUND` automatically, so
+routes no longer pre-check things the database already enforces (e.g. the
+`organizationId_email` uniqueness on `Employee`).
+
+## Auth guard
+
+`src/plugins/authGuard.ts` adds two preHandlers, used as route options
+(`{ preHandler: app.requireRole([...]) }`):
+
+- `app.requireAuth` — session must be valid (401), must have an active org on
+  the session, and the caller must have an `Employee` row in that org (403
+  otherwise). Populates `request.auth = { userId, organizationId, employeeId,
+  role }`.
+- `app.requireRole(roles: EmployeeRole[])` — same as `requireAuth`, plus a
+  403 if `request.auth.role` isn't in `roles`.
+
+Handlers read `organizationId`/`role` from `request.auth`, never from the
+request body/query — that's the one source of tenant truth for every guarded
+route.
 
 ## Endpoints
 
@@ -116,6 +177,13 @@ Because the Better Auth CLI overwrites `prisma/schema.prisma` wholesale on each 
 | GET | `/api/employees/:id/invite-link` | ADMIN/HR only. Manual-link fallback — see "Inviting an employee" below |
 | GET | `/api/invitations` | ADMIN/HR only. Pending invitations in the active org |
 | POST | `/api/invitations/:id/cancel` | ADMIN/HR only. Cancel a pending invitation |
+| GET | `/api/employees/org-chart` | Any org member. Full reporting tree — see "Org chart" below |
+| GET | `/api/employees/:id/reports` | Any org member. One employee's direct reports, same lightweight shape |
+| GET | `/leave/types` | Any org member. Active leave types for the caller's org |
+| GET | `/leave/balances/me` | Any org member. The caller's own accrued/used/available balances (current year) |
+| GET | `/leave/balances/:employeeId` | ADMIN/HR only. That employee's balances, tenant-scoped |
+| POST | `/admin/leave/accrual/run` | ADMIN only. Manually run accrual for the caller's org — see "Leave: types, balances & accrual" below |
+| POST | `/system/leave/accrual/run-all` | No session — `X-Accrual-Secret` header instead. Runs accrual for every org; the monthly cron's target |
 
 ## Email & password reset
 
@@ -180,11 +248,10 @@ registration ever 500s.
 
 ## Employee CRUD
 
-All four endpoints (`src/routes/employees.ts`) share one gate: the caller must
-have a session with an `activeOrganizationId`, and their own `Employee` record
-(looked up by `userId`) must be `ADMIN` or `HR` **in that org** — otherwise
-401/400/403. Every query/mutation is scoped to that `organizationId`; it is
-never read from the request body.
+All four endpoints (`src/routes/employees.ts`) share one gate:
+`app.requireRole(["ADMIN", "HR"])` (see "Auth guard" above) — otherwise
+401/403. Every query/mutation is scoped to `request.auth.organizationId`; it
+is never read from the request body.
 
 - `POST /api/employees` — body `{ fullName, email, role, designation?, managerId? }`.
   `role` must be `HR`, `MANAGER`, or `EMPLOYEE` — this endpoint can't mint
@@ -202,6 +269,120 @@ never read from the request body.
   fullName} | null` summary via a single Prisma `include` (no N+1).
 - `GET /api/employees/:id` — 404 (not 403) if the id exists but belongs to a
   different org, so it doesn't leak cross-tenant existence.
+
+## Org chart
+
+`GET /api/employees/org-chart` and `GET /api/employees/:id/reports`
+(`src/routes/employees.ts`, tree assembly in `src/lib/orgChart.ts`) are gated
+by `app.requireAuth` only — any authenticated member of the org can view
+them, unlike the ADMIN/HR-only CRUD above.
+
+Node shape (both endpoints): `{ id, fullName, role, designation,
+hasPortalAccess }` — no `email`, no `organizationId`, nothing beyond what's
+needed to render a chart. `org-chart` nodes additionally nest `reports:
+Node[]`.
+
+- `GET /api/employees/org-chart` — `data: { tree: Node[] }`. One
+  `prisma.employee.findMany` for the whole org, then `buildOrgChartTree`
+  assembles the forest in memory — no per-node queries. Employees with
+  `managerId: null` are roots; so are employees whose `managerId` points
+  outside the org (shouldn't happen, but tenant-scoping the query alone can't
+  rule it out) — logged as a warning and surfaced as a root rather than
+  dropped. A `managerId` cycle (data corruption — the same thing `PATCH
+  /api/employees/:id` guards against on write, see above) can't recurse
+  forever: each employee is attached to the tree at most once, so the second
+  time a cycle is walked into it's skipped with a warning instead of looping.
+  See `src/lib/orgChart.test.ts` for the multi-root/orphan/cycle cases.
+- `GET /api/employees/:id/reports` — `data: { reports: Node[] }`, direct
+  reports only (not the whole subtree), tenant-scoped, ordered by `fullName`.
+  404 if `:id` doesn't resolve to an `Employee` in the caller's org.
+
+## Leave: types, balances & accrual
+
+**Model: monthly accrual, no request/approval flow yet** (that's Prompt 2 —
+this is just the config + balance foundation and the engine that fills it).
+Each active `LeaveType` credits `accrualPerMonth` to every eligible
+employee's `LeaveBalance` once per calendar month, capped at `annualCap` for
+the year. "Eligible" means `Employee.joiningDate` is null or falls on/before
+the accrual month — no proration for a mid-month join, they get the full
+month once eligible. There's no employee "active/terminated" status field
+yet, so every `Employee` row in the org is accrual-eligible; add one before
+building offboarding.
+
+Holidays are deferred and weekends aren't excluded anywhere in this prompt —
+accrual is month-based, not day-based, so day-counting doesn't come up until
+the request/approval flow (Prompt 2), which is where the "isolate it behind
+one function so a holiday calendar can plug in later" requirement actually
+applies.
+
+**Default leave types.** `ensureDefaultLeaveTypes()`
+([src/lib/leaveTypes.ts](src/lib/leaveTypes.ts)) upserts CL (1/mo, cap 12),
+SL (1/mo, cap 12), EL (1.5/mo, cap 18) for an org, keyed on the
+`organizationId_code` unique constraint — `update: {}` on conflict, so
+calling it again (or for an org that already has them) never clobbers an
+admin's later edits. `registerCompany()` calls it right after creating the
+ADMIN `Employee`, so every new org starts with all three; if it throws, the
+same rollback that already covers a failed `Employee` create (delete the
+just-created `Organization`/`User`) applies here too.
+
+**The accrual engine** — `accrueForOrg(organizationId, year, month)`
+([src/lib/leaveAccrual.ts](src/lib/leaveAccrual.ts)):
+
+1. One query for every `Employee` in the org, one for every active
+   `LeaveType` with `accrualPerMonth > 0` — no per-employee/per-type
+   queries.
+2. For each eligible employee, all of that employee's leave-type balance
+   updates for the run are wrapped in a single `prisma.$transaction` — a
+   failure partway through rolls back that employee's whole batch instead of
+   leaving some types credited and others not. A failure doesn't stop the
+   run; it's counted in `employeesFailed` and logged, and the next employee
+   still gets processed.
+3. Per (employee, leaveType, year): upsert the `LeaveBalance` row, then skip
+   if `lastAccruedMonth >= month` (already applied) — this is what makes
+   re-running a month a no-op and lets a missed month be applied later
+   regardless of what today's date is. Otherwise credit
+   `min(accrualPerMonth, annualCap - accruedDays)` (never negative) and set
+   `lastAccruedMonth = month`.
+
+`accrueForAllOrgs(year, month)` just loops every `Organization` through
+`accrueForOrg` — used by the system endpoint below. Both are exercised by
+[src/lib/leaveAccrual.test.ts](src/lib/leaveAccrual.test.ts) (idempotency +
+cap, against disposable data in the real dev DB — this is a balance-critical
+path, not something to leave unverified).
+
+**Two ways to run it:**
+
+- `POST /admin/leave/accrual/run` — ADMIN only (narrower than the ADMIN/HR
+  gate used elsewhere, since this credits real balances), scoped to
+  `request.auth.organizationId`. Body `{ year?, month? }`, both default to
+  the current date. For manual/testing runs.
+- `POST /system/leave/accrual/run-all` — no Better Auth session; gated
+  instead by an `X-Accrual-Secret` header that must match the `ACCRUAL_SECRET`
+  env var (401 otherwise). Runs `accrueForOrg` for **every** org, for the
+  *current* month only (no `year`/`month` body — this is the unattended
+  path). This is what a monthly cron should call.
+
+**Wiring the monthly cron** (Railway/Render "scheduled job" or any external
+scheduler that can hit an HTTP endpoint once a month):
+
+```bash
+curl -X POST https://<your-api-host>/system/leave/accrual/run-all \
+  -H "X-Accrual-Secret: $ACCRUAL_SECRET"
+```
+
+Schedule it for the 1st of the month (or any day — it's idempotent and
+catches up on a missed month automatically, so an occasional late/duplicate
+run is harmless). Keep `ACCRUAL_SECRET` out of anywhere but the cron
+scheduler's own secret store and this API's env.
+
+**Balance reads** — `GET /leave/balances/me` and `GET
+/leave/balances/:employeeId` both return `data: { year, balances: [{
+leaveTypeId, code, name, accruedDays, usedDays, availableDays }] }` for every
+*active* `LeaveType` in the org, joined in memory with any existing
+`LeaveBalance` row for the current year — a type with no balance row yet
+(accrual hasn't run this year) still shows up at zero instead of being
+omitted. `availableDays` is computed (`accruedDays - usedDays`), never
+stored.
 
 ## Inviting an employee
 
