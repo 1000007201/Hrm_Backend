@@ -24,6 +24,9 @@ const envSchema = z.object({
   ACCRUAL_SECRET: z
     .string()
     .min(16, "ACCRUAL_SECRET must be at least 16 characters"),
+  // Worked minutes below this on a day with attendance => HALF_DAY instead of
+  // PRESENT. 240 (4h) is the usual Indian SME split of an 8h day.
+  ATTENDANCE_HALF_DAY_THRESHOLD_MINUTES: z.coerce.number().int().positive().default(240),
 });
 
 const parsed = envSchema.safeParse(process.env);

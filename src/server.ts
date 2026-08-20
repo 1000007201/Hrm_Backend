@@ -9,6 +9,10 @@ import { registerCompanyRoutes } from "./routes/registerCompany.js";
 import { employeeRoutes } from "./routes/employees.js";
 import { invitationRoutes } from "./routes/invitations.js";
 import { leaveRoutes } from "./routes/leave.js";
+import { leaveRequestRoutes } from "./routes/leaveRequests.js";
+import { holidayRoutes } from "./routes/holidays.js";
+import { attendanceRoutes } from "./routes/attendance.js";
+import { regularizationRoutes } from "./routes/regularizations.js";
 import { systemAccrualRoutes } from "./routes/systemAccrual.js";
 
 export const buildApp = (): FastifyInstance => {
@@ -37,6 +41,10 @@ export const buildApp = (): FastifyInstance => {
   app.register(employeeRoutes);
   app.register(invitationRoutes);
   app.register(leaveRoutes);
+  app.register(leaveRequestRoutes);
+  app.register(holidayRoutes);
+  app.register(attendanceRoutes);
+  app.register(regularizationRoutes);
   app.register(systemAccrualRoutes);
 
   return app;

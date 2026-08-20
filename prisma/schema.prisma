@@ -75,17 +75,21 @@ model Verification {
 }
 
 model Organization {
-  id            String         @id
-  name          String
-  slug          String
-  logo          String?
-  createdAt     DateTime
-  metadata      String?
-  members       Member[]
-  invitations   Invitation[]
-  employees     Employee[]
-  leaveTypes    LeaveType[]
-  leaveBalances LeaveBalance[]
+  id              String                  @id
+  name            String
+  slug            String
+  logo            String?
+  createdAt       DateTime
+  metadata        String?
+  members         Member[]
+  invitations     Invitation[]
+  employees       Employee[]
+  leaveTypes      LeaveType[]
+  leaveBalances   LeaveBalance[]
+  leaveRequests   LeaveRequest[]
+  holidays        Holiday[]
+  attendance      AttendanceRecord[]
+  regularizations RegularizationRequest[]
 
   @@unique([slug])
   @@map("organization")
@@ -154,9 +158,14 @@ model Employee {
   // SetNull (not Cascade): the Employee is an HR record independent of portal
   // login — deleting the linked User account should just revoke login, not
   // erase the HR artifact.
-  user          User?          @relation(fields: [userId], references: [id], onDelete: SetNull)
-  organization  Organization   @relation(fields: [organizationId], references: [id], onDelete: Cascade)
-  leaveBalances LeaveBalance[]
+  user                   User?                   @relation(fields: [userId], references: [id], onDelete: SetNull)
+  organization           Organization            @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  leaveBalances          LeaveBalance[]
+  leaveRequests          LeaveRequest[]          @relation("LeaveRequestsByEmployee")
+  decidedLeaveRequests   LeaveRequest[]          @relation("LeaveRequestsDecidedBy")
+  attendance             AttendanceRecord[]
+  regularizations        RegularizationRequest[] @relation("RegularizationsByEmployee")
+  decidedRegularizations RegularizationRequest[] @relation("RegularizationsDecidedBy")
 
   @@unique([organizationId, email])
   @@index([organizationId])
@@ -182,6 +191,7 @@ model LeaveType {
 
   organization Organization   @relation(fields: [organizationId], references: [id], onDelete: Cascade)
   balances     LeaveBalance[]
+  requests     LeaveRequest[]
 
   @@unique([organizationId, code])
   @@index([organizationId])
@@ -210,4 +220,185 @@ model LeaveBalance {
 
   @@unique([employeeId, leaveTypeId, year])
   @@index([organizationId])
+}
+
+enum LeaveStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  CANCELLED
+}
+
+// One row per submitted leave request. workingDays is computed by
+// countWorkingDays (src/lib/workingDays.ts) at submission time and stored —
+// it's the amount reserved against the balance while PENDING, and the amount
+// deducted (LeaveBalance.usedDays) on APPROVED. REJECTED/CANCELLED never
+// touch usedDays, since a pending request was only ever reserved, not
+// deducted (see src/lib/leaveRequests.ts).
+model LeaveRequest {
+  id             String @id @default(cuid())
+  organizationId String
+  employeeId     String
+  leaveTypeId    String
+
+  // @db.Date: calendar dates, no time-of-day/timezone — see the UTC-only
+  // handling note in src/lib/workingDays.ts.
+  startDate   DateTime @db.Date
+  endDate     DateTime @db.Date
+  isHalfDay   Boolean  @default(false)
+  reason      String?
+  workingDays Decimal  @db.Decimal(6, 2)
+
+  status              LeaveStatus @default(PENDING)
+  decidedByEmployeeId String?
+  decidedAt           DateTime?
+  decisionNote        String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  employee     Employee     @relation("LeaveRequestsByEmployee", fields: [employeeId], references: [id], onDelete: Cascade)
+  leaveType    LeaveType    @relation(fields: [leaveTypeId], references: [id], onDelete: Cascade)
+  decidedBy    Employee?    @relation("LeaveRequestsDecidedBy", fields: [decidedByEmployeeId], references: [id])
+
+  @@index([organizationId])
+  @@index([employeeId])
+  @@index([status])
+}
+
+// A company holiday for one org. countWorkingDays (src/lib/workingDays.ts)
+// excludes these alongside weekends, so leave spanning a holiday costs the
+// employee fewer leave days.
+model Holiday {
+  id             String @id @default(cuid())
+  organizationId String
+
+  // @db.Date for the same reason as LeaveRequest.startDate: a holiday is a
+  // calendar date, not an instant. `year` is derived from `date` at write
+  // time (there's no computed-column support here) purely so the common
+  // "the org's calendar for 2026" query is a plain indexed lookup.
+  date DateTime @db.Date
+  name String
+  year Int
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@unique([organizationId, date])
+  @@index([organizationId, year])
+}
+
+enum AttendanceStatus {
+  PRESENT
+  ABSENT
+  HALF_DAY
+  ON_LEAVE
+  HOLIDAY
+  WEEK_OFF
+}
+
+enum AttendanceSource {
+  SELF
+  HR_MARKED
+  SYSTEM
+  // Written by an APPROVED RegularizationRequest. Distinct from HR_MARKED so
+  // the audit trail separates "HR edited this directly" from "the employee
+  // asked and an approver agreed" — both are explicit human decisions and
+  // both win over recomputing status from clock times (see
+  // isExplicitHumanDecision in src/lib/attendance.ts).
+  REGULARIZED
+}
+
+// One row per (employee, day) — only for days something was actually
+// recorded. Days with no row still get a status (WEEK_OFF/HOLIDAY/ON_LEAVE/
+// ABSENT) from deriveDailyStatus (src/lib/attendance.ts); the table is
+// deliberately sparse rather than pre-seeding a row per employee per day.
+model AttendanceRecord {
+  id             String @id @default(cuid())
+  organizationId String
+  employeeId     String
+
+  // @db.Date, UTC calendar day — same convention as LeaveRequest.startDate
+  // and Holiday.date. checkInAt/checkOutAt are full instants (timestamps).
+  date          DateTime  @db.Date
+  checkInAt     DateTime?
+  checkOutAt    DateTime?
+  // Derived at check-out from checkOutAt - checkInAt; null while the day is
+  // still open (checked in, not yet out).
+  workedMinutes Int?
+
+  status AttendanceStatus
+  source AttendanceSource
+  note   String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  employee     Employee     @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+
+  @@unique([employeeId, date])
+  @@index([organizationId, date])
+}
+
+enum RegularizationStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  CANCELLED
+}
+
+enum RegularizationType {
+  MISSING_PUNCH
+  WRONG_TIME
+  WFH
+  OTHER
+}
+
+// An employee-initiated request to correct their own attendance for one day,
+// approved by any MANAGER/HR/ADMIN. Approving applies the correction to the
+// AttendanceRecord (source REGULARIZED); the request row itself is kept as
+// the audit trail of who asked, who decided, and why.
+//
+// "At most one PENDING per (employeeId, date)" is enforced by a PARTIAL
+// unique index — Prisma's @@unique can't express a WHERE clause, so it's
+// hand-written in the migration:
+//   CREATE UNIQUE INDEX "RegularizationRequest_one_pending_per_employee_date"
+//     ON "RegularizationRequest"("employeeId", "date") WHERE status = 'PENDING';
+// A plain @@unique would wrongly block re-requesting after a rejection, and
+// an app-level check alone races under concurrent submits.
+model RegularizationRequest {
+  id             String @id @default(cuid())
+  organizationId String
+  employeeId     String
+
+  // @db.Date, UTC calendar day — same convention as AttendanceRecord.date.
+  date DateTime           @db.Date
+  type RegularizationType
+
+  // What the employee is asking for. At least one must be present (enforced
+  // by zod at the route); null means "leave that field as it is".
+  requestedCheckInAt  DateTime?
+  requestedCheckOutAt DateTime?
+  requestedStatus     AttendanceStatus?
+  reason              String
+
+  status              RegularizationStatus @default(PENDING)
+  decidedByEmployeeId String?
+  decidedAt           DateTime?
+  decisionNote        String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  employee     Employee     @relation("RegularizationsByEmployee", fields: [employeeId], references: [id], onDelete: Cascade)
+  decidedBy    Employee?    @relation("RegularizationsDecidedBy", fields: [decidedByEmployeeId], references: [id])
+
+  @@index([organizationId])
+  @@index([employeeId])
+  @@index([status])
 }

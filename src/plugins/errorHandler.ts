@@ -36,6 +36,16 @@ export const registerErrorHandler = (app: FastifyInstance) => {
         reply.status(404);
         return { success: false, error: { code: "NOT_FOUND" satisfies ErrorCode, message: "Record not found" } };
       }
+      if (err.code === "P2034") {
+        // Write conflict/deadlock under a Serializable transaction (used for
+        // balance-critical writes like leave submission/approval) — the
+        // transaction was rolled back in full, nothing partially applied.
+        reply.status(409);
+        return {
+          success: false,
+          error: { code: "CONFLICT" satisfies ErrorCode, message: "That conflicted with another update — please try again" },
+        };
+      }
     }
 
     request.log.error(err);

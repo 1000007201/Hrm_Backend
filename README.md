@@ -59,6 +59,7 @@ All variables are validated at startup by [src/env.ts](src/env.ts); the process 
 | `ENABLE_PUBLIC_SIGNUP` | `false` | Opens `POST /api/register-company` to the public. While `false`, callers must send `REGISTRATION_SECRET` as an `X-Registration-Secret` header |
 | `REGISTRATION_SECRET` | unset | Shared secret gating company registration (min 16 chars). Generate with `openssl rand -base64 32`. Irrelevant once `ENABLE_PUBLIC_SIGNUP=true` |
 | `ACCRUAL_SECRET` | — | Required, min 16 chars. Shared secret gating `POST /system/leave/accrual/run-all` (sent as `X-Accrual-Secret`) — see "Leave: types, balances & accrual" below |
+| `ATTENDANCE_HALF_DAY_THRESHOLD_MINUTES` | `240` | Worked minutes below this on a day with attendance count as `HALF_DAY` instead of `PRESENT` — see "Attendance" below |
 
 ## Layout
 
@@ -75,6 +76,10 @@ src/lib/response.ts        ok(data) — wraps a successful payload in the { succ
 src/lib/orgChart.ts        buildOrgChartTree() — assembles the reporting forest in memory, handles orphans/cycles
 src/lib/leaveTypes.ts      ensureDefaultLeaveTypes() — idempotent CL/SL/EL seeding, called from registerCompany()
 src/lib/leaveAccrual.ts    accrueForOrg() / accrueForAllOrgs() — the monthly accrual engine
+src/lib/workingDays.ts     countWorkingDays() — the ONE place weekend + holiday logic lives
+src/lib/attendance.ts      deriveDailyStatus() — the ONE place attendance/leave/holiday reconciliation lives
+src/lib/holidays.ts        getHolidayDateKeys() — builds the holiday set countWorkingDays takes
+src/lib/leaveRequests.ts   getEffectiveAvailableDays() — the submission-time reservation-balance formula
 src/plugins/auth.ts        Mounts Better Auth's handler at /api/auth/*, decorates request.getSession()
 src/plugins/authGuard.ts   app.requireAuth / app.requireRole([...]) preHandlers; populate request.auth
 src/plugins/errorHandler.ts  Central setErrorHandler — AppError/zod/Prisma errors -> the { success: false, error } envelope
@@ -83,6 +88,10 @@ src/routes/registerCompany.ts  POST /api/register-company
 src/routes/employees.ts    Employee CRUD + org chart (ADMIN/HR for CRUD, any org member for reads), tenant-scoped
 src/routes/invitations.ts  Invite/accept-link/list/cancel (ADMIN/HR only, tenant-scoped)
 src/routes/leave.ts        GET /leave/*, POST /admin/leave/accrual/run — see "Leave: types, balances & accrual" below
+src/routes/leaveRequests.ts  Submit/list/cancel/approve/reject — see "Leave requests" below
+src/routes/holidays.ts     Holiday calendar CRUD + bulk upload — see "Holiday calendar" below
+src/routes/attendance.ts   Check-in/out, month + day views, HR mark — see "Attendance" below
+src/routes/regularizations.ts  Employee-requested attendance corrections — see "Attendance regularization" below
 src/routes/systemAccrual.ts  POST /system/leave/accrual/run-all — secret-header gated, no session (cron target)
 src/lib/invitations.ts     EmployeeRole <-> org role mapping, accept-URL builder, link-on-accept logic
 src/server.ts              App factory: builds the Fastify instance, registers cors/plugins/routes
@@ -111,7 +120,8 @@ prisma/seed.ts              Demo company + ADMIN via registerCompany(), idempote
 - `LeaveType` — one row per (org, leave code), e.g. `CL`/`SL`/`EL`
   (`@@unique([organizationId, code])`). `accrualPerMonth` (`Decimal`) is
   credited monthly up to `annualCap` (days/year). `isPaid`/`allowHalfDay` are
-  metadata for the request/approval flow (not built yet — Prompt 2).
+  metadata — `allowHalfDay` now gates half-day requests, see "Leave requests"
+  below.
 - `LeaveBalance` — one row per (employee, leave type, year)
   (`@@unique([employeeId, leaveTypeId, year])`). Stores `accruedDays` and
   `usedDays` (both `Decimal`, avoids float drift on day amounts);
@@ -119,6 +129,34 @@ prisma/seed.ts              Demo company + ADMIN via registerCompany(), idempote
   stored.** `lastAccruedMonth` (1-12) is the last calendar month the accrual
   engine applied for that year — see "Leave: types, balances & accrual"
   below.
+- `LeaveRequest` — one row per submission. `workingDays` (`Decimal`) is
+  computed by `countWorkingDays` at submission time and stored — it's the
+  amount reserved against the balance while `status: PENDING`, and the
+  amount moved into `LeaveBalance.usedDays` on `APPROVED`.
+  `status: LeaveStatus` (`PENDING | APPROVED | REJECTED | CANCELLED`).
+  `decidedByEmployeeId`/`decidedAt`/`decisionNote` are set on
+  approve/reject, null until then. See "Leave requests" below for the full
+  lifecycle and the reservation-vs-deduction model.
+- `Holiday` — one company holiday per date per org
+  (`@@unique([organizationId, date])`, indexed on `[organizationId, year]`).
+  `date` is `@db.Date` (a calendar date, not an instant); `year` is derived
+  from `date` at write time — there's no computed-column support here, and
+  it exists purely so "the org's calendar for 2026" is a plain indexed
+  lookup. See "Holiday calendar" below.
+- `AttendanceRecord` — one row per (employee, day), `@@unique([employeeId,
+  date])`. **Deliberately sparse:** a row exists only for days something was
+  actually recorded (a check-in or an HR mark); days with no row still get a
+  status from `deriveDailyStatus`, so nothing pre-seeds a row per employee
+  per day. `status: AttendanceStatus` (`PRESENT | ABSENT | HALF_DAY |
+  ON_LEAVE | HOLIDAY | WEEK_OFF`), `source: AttendanceSource` (`SELF |
+  HR_MARKED | SYSTEM | REGULARIZED`). `workedMinutes` is derived at check-out
+  and stays null while a day is still open. See "Attendance" below.
+- `RegularizationRequest` — an employee-initiated request to correct their
+  own attendance for one day, decided by any MANAGER/HR/ADMIN. Approving
+  writes the correction onto the `AttendanceRecord`; the request row is kept
+  as the audit trail (who asked, who decided, when, why). "At most one
+  `PENDING` per (employee, date)" is a **partial** unique index, hand-written
+  in the migration — see "Attendance regularization" below.
 
 Because the Better Auth CLI overwrites `prisma/schema.prisma` wholesale on each run, the `Employee` model and the `employee`/`employees` reverse-relation fields on `User`/`Organization` are hand-maintained — re-add them if you ever regenerate and see them missing.
 
@@ -184,6 +222,28 @@ route.
 | GET | `/leave/balances/:employeeId` | ADMIN/HR only. That employee's balances, tenant-scoped |
 | POST | `/admin/leave/accrual/run` | ADMIN only. Manually run accrual for the caller's org — see "Leave: types, balances & accrual" below |
 | POST | `/system/leave/accrual/run-all` | No session — `X-Accrual-Secret` header instead. Runs accrual for every org; the monthly cron's target |
+| POST | `/leave/requests` | Any org member. Submit a leave request for yourself — see "Leave requests" below |
+| GET | `/leave/requests/me` | Any org member. Your own requests, optional `?status=` filter |
+| POST | `/leave/requests/:id/cancel` | Any org member. Cancel your OWN request — PENDING only |
+| GET | `/leave/requests/pending` | MANAGER/HR/ADMIN only. Org-wide approver queue |
+| POST | `/leave/requests/:id/approve` | MANAGER/HR/ADMIN only. Deducts `usedDays` atomically |
+| POST | `/leave/requests/:id/reject` | MANAGER/HR/ADMIN only. No balance change |
+| GET | `/holidays?year=YYYY` | Any org member. The org's holiday calendar for a year (defaults to current) |
+| POST | `/holidays` | ADMIN/HR only. Add one holiday `{ date, name }` |
+| POST | `/holidays/bulk` | ADMIN/HR only. Idempotent bulk upsert of a month's or a year's list |
+| DELETE | `/holidays/:id` | ADMIN/HR only. 404 if the holiday belongs to another org |
+| POST | `/attendance/check-in` | Any org member, for themselves. Rejected on a week off / holiday / approved-leave day |
+| POST | `/attendance/check-out` | Any org member. Computes `workedMinutes` and the PRESENT/HALF_DAY split |
+| GET | `/attendance/me?month=YYYY-MM` | Any org member. Their full month, every day with a derived status |
+| GET | `/attendance?date=YYYY-MM-DD` | ADMIN/HR only. The org's derived status for one day, all employees |
+| GET | `/attendance/:employeeId?month=YYYY-MM` | ADMIN/HR only. One employee's month, tenant-scoped |
+| POST | `/attendance/mark` | ADMIN/HR only. Mark or correct one employee's day (`source: HR_MARKED`) |
+| POST | `/attendance/regularizations` | Any org member, for themselves. Request a correction for a past working day |
+| GET | `/attendance/regularizations/me` | Any org member. Their own requests, optional `?status=` filter |
+| POST | `/attendance/regularizations/:id/cancel` | Any org member. Cancel their OWN `PENDING` request |
+| GET | `/attendance/regularizations/pending` | MANAGER/HR/ADMIN only. Approver queue with before/after context |
+| POST | `/attendance/regularizations/:id/approve` | MANAGER/HR/ADMIN only. Applies the correction (`source: REGULARIZED`) |
+| POST | `/attendance/regularizations/:id/reject` | MANAGER/HR/ADMIN only. No attendance change |
 
 ## Email & password reset
 
@@ -299,21 +359,17 @@ Node[]`.
 
 ## Leave: types, balances & accrual
 
-**Model: monthly accrual, no request/approval flow yet** (that's Prompt 2 —
-this is just the config + balance foundation and the engine that fills it).
-Each active `LeaveType` credits `accrualPerMonth` to every eligible
-employee's `LeaveBalance` once per calendar month, capped at `annualCap` for
-the year. "Eligible" means `Employee.joiningDate` is null or falls on/before
-the accrual month — no proration for a mid-month join, they get the full
-month once eligible. There's no employee "active/terminated" status field
-yet, so every `Employee` row in the org is accrual-eligible; add one before
-building offboarding.
+**Model: monthly accrual.** Each active `LeaveType` credits `accrualPerMonth`
+to every eligible employee's `LeaveBalance` once per calendar month, capped
+at `annualCap` for the year. "Eligible" means `Employee.joiningDate` is null
+or falls on/before the accrual month — no proration for a mid-month join,
+they get the full month once eligible. There's no employee
+"active/terminated" status field yet, so every `Employee` row in the org is
+accrual-eligible; add one before building offboarding.
 
-Holidays are deferred and weekends aren't excluded anywhere in this prompt —
-accrual is month-based, not day-based, so day-counting doesn't come up until
-the request/approval flow (Prompt 2), which is where the "isolate it behind
-one function so a holiday calendar can plug in later" requirement actually
-applies.
+Accrual itself is month-based, not day-based, so it doesn't use
+`countWorkingDays` — weekends only come into play once actual dates are
+being counted, which is the request lifecycle below.
 
 **Default leave types.** `ensureDefaultLeaveTypes()`
 ([src/lib/leaveTypes.ts](src/lib/leaveTypes.ts)) upserts CL (1/mo, cap 12),
@@ -383,6 +439,292 @@ leaveTypeId, code, name, accruedDays, usedDays, availableDays }] }` for every
 (accrual hasn't run this year) still shows up at zero instead of being
 omitted. `availableDays` is computed (`accruedDays - usedDays`), never
 stored.
+
+## Leave requests
+
+**Lifecycle:** `PENDING` → `APPROVED` | `REJECTED`, or the requester cancels
+their own `PENDING` request → `CANCELLED`. Any `MANAGER`/`HR`/`ADMIN` in the
+org can approve or reject **any** pending request — flexible routing, not
+strict manager-of-record (locked decision for this stage).
+
+**`countWorkingDays(startDate, endDate, isHalfDay, holidayDateKeys?)`**
+([src/lib/workingDays.ts](src/lib/workingDays.ts)) is the **one and only**
+place day-counting/weekend/holiday logic lives in the whole codebase — every
+balance calculation that counts days routes through it. It excludes Sat/Sun
+**and** any injected company holidays, and returns `0.5` for a
+(single-day-only) half day. Dates are handled in UTC throughout (matches how
+Prisma round-trips the `@db.Date` columns), so day-of-week doesn't drift with
+the server's local timezone. Verified by
+[src/lib/workingDays.test.ts](src/lib/workingDays.test.ts).
+
+Holidays are **injected, not queried inside** — the function stays pure and
+synchronous, so it's testable without a database and does no hidden I/O.
+Callers build the set first with `getHolidayDateKeys(db, organizationId,
+startDate, endDate)` ([src/lib/holidays.ts](src/lib/holidays.ts)), which
+pairs the tenant-scoped query with the same `toUtcDateKey` formatting the
+counter looks up — that pairing is why the key format can't silently drift
+apart (a real failure mode, covered by a DB round-trip test in
+`holidays.test.ts`).
+
+**Reservation vs. deduction — the two balance checks are deliberately
+different:**
+
+- **Submission** (`POST /leave/requests`) uses the *effective available*
+  formula — `accruedDays - usedDays - (this employee's own PENDING requests
+  for the same leave type/year)` — via `getEffectiveAvailableDays`
+  ([src/lib/leaveRequests.ts](src/lib/leaveRequests.ts),
+  tested in `leaveRequests.test.ts`). Subtracting pending reservations is
+  what stops two overlapping/oversized pending submits from both fitting
+  under the same real balance — a `PENDING` request reserves but never
+  touches `usedDays`.
+- **Approval** (`POST /leave/requests/:id/approve`) deliberately does
+  **not** reuse that formula — it checks the plain real balance
+  (`accruedDays - usedDays`) instead. Reasoning: by approval time, only
+  whether the real balance still covers *this* request matters; other still-
+  pending requests are each judged independently when their own turn comes,
+  so they shouldn't block this one. Approving increments `usedDays` by
+  `workingDays` in the same transaction that flips `status: APPROVED`.
+- **Reject/cancel** touch no balance at all — a `PENDING` request was only
+  ever a reservation, so moving it to `REJECTED`/`CANCELLED` just frees that
+  reservation for the next `getEffectiveAvailableDays` call to see.
+
+**Concurrency:** submission (read-reservation-then-insert) and approval
+(read-balance-then-increment) are both read-then-write sequences that Postgres's
+default READ COMMITTED isolation wouldn't fully protect against two
+simultaneous callers each passing the check before either commits. Both run
+inside a `Serializable` Prisma transaction instead, so Postgres aborts one
+side of any real conflict rather than letting both apply — surfaced by the
+central error handler as `409 CONFLICT` (Prisma error `P2034`, "please
+retry"; see [src/plugins/errorHandler.ts](src/plugins/errorHandler.ts)).
+Approval's status check (`still PENDING?`) is re-verified inside that same
+transaction, so a request already decided by someone else cleanly 409s
+instead of double-applying.
+
+**Endpoints** (bodies/behavior beyond the table above):
+
+- `POST /leave/requests` — body `{ leaveTypeId, startDate, endDate,
+  isHalfDay?, reason? }`. Validates: `leaveTypeId` is active and in the
+  caller's org; `endDate >= startDate`; `isHalfDay` only for a single-day
+  range and only if `LeaveType.allowHalfDay`; rejects a weekend-only range
+  (`countWorkingDays` returns 0); rejects if it overlaps the requester's own
+  `PENDING`/`APPROVED` requests **for any leave type** (can't be on two
+  leaves at once); rejects if `workingDays` exceeds the effective available
+  balance. `employeeId` always comes from `request.auth`, never the body.
+- `GET /leave/requests/me` — optional `?status=PENDING|APPROVED|REJECTED|CANCELLED`.
+- `POST /leave/requests/:id/cancel` — requester only, own request only,
+  `PENDING` only (kept simple for now — cancelling a future-dated `APPROVED`
+  request is a possible later extension). 404 if it's not the caller's
+  request or belongs to another org; 409 if it's no longer `PENDING`.
+- `GET /leave/requests/pending` — org-wide queue, includes `employee: {id,
+  fullName}` and `leaveType: {id, name, code}` via a single Prisma
+  `include` each (no N+1).
+- `POST /leave/requests/:id/approve` / `.../reject` — optional body
+  `{ decisionNote? }`. Both 404 if the request isn't in the caller's org,
+  409 if it's no longer `PENDING`. **Self-approval is allowed** (any
+  approver-role employee, including the requester themselves if they hold
+  `MANAGER`/`HR`/`ADMIN`) — `src/routes/leaveRequests.ts` has a `TODO`
+  flagging this as a policy option to revisit once approval routing gets
+  stricter than "any approver role in the org".
+
+## Holiday calendar
+
+Per-org company holidays ([src/routes/holidays.ts](src/routes/holidays.ts)),
+excluded from leave day-counting alongside weekends — leave spanning a
+holiday costs the employee fewer leave days. Management is ADMIN/HR only;
+**reading is open to any org member**, since everyone needs to see the
+company calendar.
+
+> **No retroactive recompute.** Editing the calendar only affects **new**
+> leave submissions. Existing requests keep the `workingDays` they were
+> stored with at submission — including `PENDING` ones — and approved
+> deductions are never revisited. Adding a holiday in the middle of a month
+> will not refund anyone who already booked leave across it; that would mean
+> silently rewriting balances, so it's a deliberate non-goal. Cancel and
+> resubmit if a request genuinely needs recounting.
+
+- `GET /holidays?year=YYYY` — `data: { year, holidays: [{ id, date, name,
+  year }] }`, ordered by date, defaulting to the current year.
+- `POST /holidays` — body `{ date, name }`. A duplicate date hits the
+  `organizationId_date` unique constraint and surfaces as `409 CONFLICT` via
+  the central error handler; use the bulk endpoint if you want upsert
+  semantics instead.
+- `POST /holidays/bulk` — body `{ holidays: [{ date, name }, ...] }` (1–366
+  entries). **One endpoint covers both "upload a month" and "upload a year"
+  — it's just a longer or shorter list.** Upserts on `(organizationId,
+  date)` inside a transaction, so re-uploading the same list is idempotent
+  and never creates duplicates. Returns
+  `data: { added, updated, unchanged, duplicatesInPayload, received }` —
+  `updated` means the date already existed with a *different* name,
+  `unchanged` means it was already identical. A date repeated within a single
+  payload is de-duplicated (last entry wins) and counted in
+  `duplicatesInPayload`, since upserting the same row twice in one
+  transaction would otherwise self-conflict.
+- `DELETE /holidays/:id` — scoped via `deleteMany` on `{ id, organizationId }`
+  so a holiday in another org matches nothing and 404s rather than being
+  deleted across the tenant boundary.
+
+A leave range that is entirely weekends and/or holidays counts 0 working days
+and is rejected by the existing "no working days" rule.
+
+## Attendance
+
+Self check-in/out plus HR marking ([src/routes/attendance.ts](src/routes/attendance.ts)),
+reconciled against leave, holidays and weekends by one isolated function.
+For employee-initiated corrections see "Attendance regularization" below.
+
+**`deriveDailyStatus(...)`** ([src/lib/attendance.ts](src/lib/attendance.ts))
+is **THE ONE PLACE** attendance/leave/holiday/weekend reconciliation lives —
+the attendance counterpart to `countWorkingDays`. Nothing else decides what a
+given day "is"; every view (self month, HR day, HR month) *and* the check-in
+guard route through it, so they cannot disagree. It reuses `isWeekend` from
+[src/lib/workingDays.ts](src/lib/workingDays.ts) rather than re-deriving the
+weekend rule.
+
+Priority order — first match wins:
+
+| # | Condition | Status |
+| --- | --- | --- |
+| 1 | Saturday/Sunday | `WEEK_OFF` |
+| 2 | Org holiday that day | `HOLIDAY` |
+| 3 | Approved leave covering that day | `ON_LEAVE` |
+| 4 | A record exists | HR's stored status if `source: HR_MARKED`, else `PRESENT`/`HALF_DAY` by worked time |
+| 5 | Past working day, no record | `ABSENT` |
+| 6 | Today or future, no record | `null` — not yet determined |
+
+`null` is deliberately **not** an `AttendanceStatus` member: "we don't know
+yet" isn't a state worth persisting, and today shouldn't read as an absence
+before the day is over. Layer 4 lets an HR correction (including a forced
+`ABSENT`) beat recomputing from clock times, since it's an explicit human
+decision.
+
+Like `countWorkingDays`, it's **pure and synchronous** — all data is
+injected, including `today`, so it's fully testable without a database or a
+clock. Callers bulk-load first via `loadAttendanceContext`, which fetches
+holidays, approved leave and existing records in **exactly three queries**
+regardless of how many employees or days are in range. That's what keeps the
+month and day views free of N+1. Approved leave is stored as ranges and
+expanded to per-day keys in memory.
+
+**Half-day threshold:** `ATTENDANCE_HALF_DAY_THRESHOLD_MINUTES` (default
+`240` = 4h of an 8h day). `statusFromWorkedMinutes` is the single rule
+comparing worked time to it — check-out uses it to *store* a status and
+derivation uses it to *read* one back, which is why the two can't drift on
+the comparison. A day checked in but not yet out (`workedMinutes: null`)
+counts as `PRESENT`, not a half day — the day is still open.
+
+**Endpoints:**
+
+- `POST /attendance/check-in` — `employeeId` always from `request.auth`,
+  never the body. Upserts today's record with `checkInAt` and `source: SELF`.
+  409 if already checked in, or if today derives to `WEEK_OFF`/`HOLIDAY`/
+  `ON_LEAVE` (each with its own message). Runs in a `Serializable`
+  transaction so two simultaneous check-ins can't both insert.
+- `POST /attendance/check-out` — sets `checkOutAt`, computes `workedMinutes`,
+  and stores the PRESENT/HALF_DAY split. 409 if there's no check-in today, or
+  if already checked out.
+- `GET /attendance/me?month=YYYY-MM` — defaults to the current month. Returns
+  `data: { year, month, days: [{ date, status, checkInAt, checkOutAt,
+  workedMinutes, source, note }] }` for **every** day of the month.
+- `GET /attendance?date=YYYY-MM-DD` — defaults to today. Every employee in
+  the org with their derived status for that day.
+- `GET /attendance/:employeeId?month=YYYY-MM` — 404 if the employee is in
+  another org.
+- `POST /attendance/mark` — body `{ employeeId, date, status?, checkInAt?,
+  checkOutAt?, note? }` (at least one of status/checkInAt/checkOutAt).
+  Upserts with `source: HR_MARKED`. Times merge with what's already stored
+  (so in-now/out-later across two calls recomputes correctly), and an
+  explicit `status` wins over the worked-time rule.
+
+> **Timezone caveat:** calendar days are UTC throughout, matching the rest of
+> the codebase (`@db.Date` columns). For IST (UTC+5:30) a check-in before
+> 05:30 local lands on the previous UTC day. Fine for a single-timezone
+> Indian SME during working hours, but a per-org timezone is the right fix
+> before this goes anywhere multi-region.
+
+## Attendance regularization
+
+Employee-initiated attendance corrections
+([src/routes/regularizations.ts](src/routes/regularizations.ts)): the
+employee asks, any MANAGER/HR/ADMIN decides, and an approval applies the
+correction to the `AttendanceRecord`.
+
+**Mark vs. regularize — two different write paths, deliberately:**
+
+| | `POST /attendance/mark` | `POST /attendance/regularizations` → approve |
+| --- | --- | --- |
+| Who starts it | ADMIN/HR | The employee, for themselves |
+| Approval | None — applied immediately | Any MANAGER/HR/ADMIN must approve |
+| Audit trail | The record's `note` | A `RegularizationRequest` row: reason, decider, decision note, timestamps |
+| Record `source` | `HR_MARKED` | `REGULARIZED` |
+
+Both are explicit human decisions and both beat recomputing status from clock
+times; they differ in *who initiates* and *whether there's a reviewable
+paper trail*. `mark` stays as the direct HR override for routine fixes.
+
+**New `AttendanceSource.REGULARIZED`.** Kept distinct from `HR_MARKED` so the
+audit trail separates "HR edited this directly" from "the employee asked and
+an approver agreed". Because both must override worked-time recomputation,
+`deriveDailyStatus` classifies them through one named predicate
+(`isExplicitHumanDecision`) rather than a bare `=== "HR_MARKED"` comparison —
+without that, an approved correction whose status disagrees with the clock
+(a granted `HALF_DAY` on a day with full punches, a forced `ABSENT`) would be
+silently recomputed away. There's a regression test pinning exactly that.
+
+**Lifecycle:** `PENDING` → `APPROVED` | `REJECTED`, or the requester cancels
+their own `PENDING` → `CANCELLED`. Only approval touches the
+`AttendanceRecord`; reject and cancel change nothing, since a pending request
+never applied anything in the first place.
+
+**At most one open request per date** is enforced by a **partial** unique
+index, hand-written in the migration because Prisma's `@@unique` can't
+express a `WHERE` clause:
+
+```sql
+CREATE UNIQUE INDEX "RegularizationRequest_one_pending_per_employee_date"
+  ON "RegularizationRequest"("employeeId", "date") WHERE status = 'PENDING';
+```
+
+Partial, not plain: a plain unique index would wrongly block re-requesting a
+date after a rejection. The route also pre-checks (for a clear error
+message), but that check races under concurrent submits — the index is the
+actual guarantee, surfacing as `409 CONFLICT` via the existing `P2002`
+mapping.
+
+**Endpoints:**
+
+- `POST /attendance/regularizations` — body `{ date, type, requestedCheckInAt?,
+  requestedCheckOutAt?, requestedStatus?, reason }`. `type` is
+  `MISSING_PUNCH | WRONG_TIME | WFH | OTHER`. `employeeId` always from
+  `request.auth`. Validation: date not in the future; at least one of the
+  three `requested*` fields; `reason` required; `requestedCheckInAt` must
+  fall on the date being regularized; `requestedCheckOutAt` must be after it
+  (**not** required to be the same day — an overnight shift legitimately
+  punches out after midnight). 409 if the date derives to `WEEK_OFF` or
+  `HOLIDAY` (nothing to regularize) — checked via `deriveDailyStatus`, not a
+  second copy of that logic.
+- `GET /attendance/regularizations/me` — optional `?status=` filter.
+- `POST /attendance/regularizations/:id/cancel` — own `PENDING` only.
+- `GET /attendance/regularizations/pending` — each row carries the requester
+  summary plus `current: { status, checkInAt, checkOutAt, workedMinutes }`,
+  the **currently derived** state of that date, so the approver sees
+  before-vs-after. One bulk `loadAttendanceContext` spanning every queued
+  date, so this costs the same 3 queries whether the queue holds 1 row or
+  500.
+- `POST /attendance/regularizations/:id/approve` — in a `Serializable`
+  transaction: re-checks still `PENDING`, upserts the `AttendanceRecord`
+  merging requested times over whatever is already stored (a null requested
+  field means "leave it alone"), recomputes `workedMinutes` when both punches
+  are present, and applies `requestedStatus` if given — otherwise falling
+  back to the shared `statusFromWorkedMinutes` rule so a pure missing-punch
+  fix lands on the same PRESENT/HALF_DAY split a self check-out would have
+  produced. Returns both the updated request and the resulting record.
+- `POST /attendance/regularizations/:id/reject` — sets `REJECTED` with the
+  decision fields; no record change.
+
+**Self-approval is allowed** for now (an approver-role employee can approve
+their own regularization) — `src/routes/regularizations.ts` carries a `TODO`
+flagging it as a policy option, matching the same open question on leave
+approvals.
 
 ## Inviting an employee
 
