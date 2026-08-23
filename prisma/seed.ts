@@ -1,5 +1,5 @@
-import { prisma } from "../src/lib/prisma.js";
-import { registerCompany } from "../src/lib/registerCompany.js";
+import { prisma } from "../src/core/prisma.js";
+import { registerCompany } from "../src/modules/identity/registerCompany.js";
 
 const DEMO_COMPANY_NAME = process.env.DEMO_COMPANY_NAME ?? "Acme Demo Co";
 const DEMO_ADMIN_NAME = process.env.DEMO_ADMIN_NAME ?? "Demo Admin";

@@ -82,19 +82,45 @@ bare `prisma` will fail in the shell).
 
 ## Architecture
 
+**Feature-first.** Infrastructure in `core/`, primitives shared by 2+ features
+in `shared/`, one folder per feature under `modules/`.
+
 ```
 src/
-  index.ts          boot: validate env, build app, listen
-  server.ts         app factory: register cors, plugins, routes
-  env.ts            zod env validation — fails fast at boot
-  lib/prisma.ts     PrismaClient singleton (globalThis-cached in dev)
-  lib/auth.ts       Better Auth config
-  plugins/auth.ts   mounts /api/auth/*, adds request.getSession()
-  routes/           feature routes (health.ts for now)
+  index.ts            boot: validate env, build app, listen, graceful shutdown
+  server.ts           composition root: cors -> plugins -> error handler -> modules
+  env.ts              zod env validation — fails fast at boot
+  core/               cross-cutting infra, NO feature knowledge
+    prisma.ts         PrismaClient singleton (globalThis-cached in dev)
+    auth.ts           Better Auth config
+    email.ts          sendEmail() — Resend, console fallback in dev
+    errors.ts         AppError — thrown for every known failure
+    response.ts       ok(data) — the success envelope
+    plugins/          auth.ts (mounts /api/auth/*), authGuard.ts, errorHandler.ts
+  shared/             domain primitives used by MORE THAN ONE module
+    workingDays.ts    countWorkingDays() — the one place weekend/holiday counting lives
+  modules/<feature>/  one folder per feature (identity, employees, leave,
+                      holidays, attendance, health)
 prisma/
   schema.prisma
-  migrations/       committed to git — never delete
+  migrations/         committed to git — never delete
 ```
+
+**Where code goes inside a module — follow this, it is the main convention:**
+
+- `*.routes.ts` — HTTP ONLY. Parse with zod, authorize via the guard, call one
+  service function, return `ok(...)`. No transactions, no multi-step rules.
+- `*.service.ts` — the business operations, signature `(prisma, params)`.
+  Every transaction and multi-step rule lives here so it is testable without
+  HTTP and callable from a cron or script.
+- Pure domain logic (`derivation.ts`, `orgChart.ts`, `accrual.ts`, …) takes its
+  inputs as arguments — no DB, no clock, no config reads — so it stays
+  synchronously testable. Config (e.g. the half-day threshold) is resolved in
+  the service layer and passed down.
+- Tests are colocated: `foo.ts` -> `foo.test.ts` beside it.
+
+A new feature = a new folder under `modules/` + one line in `server.ts`. If you
+find yourself editing five folders to add one feature, the split is wrong.
 
 ## The auth model — internalize this
 
@@ -129,8 +155,8 @@ to `Employee`. Do NOT hand-edit fields the Better Auth CLI owns — regenerate v
 - **Every mutation must be tenant-scoped.** Filter by `organizationId` from the
   session. A user must never read or write another company's data. Treat missing
   tenant scoping as a bug.
-- Prefer small, focused route files under `src/routes/`, registered in
-  `server.ts`.
+- Keep route files thin and focused — see the module layout rules under
+  "Architecture". Business logic belongs in a `*.service.ts`, not in a handler.
 
 ## Coding standards
 

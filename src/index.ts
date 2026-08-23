@@ -1,6 +1,6 @@
 import { env } from "./env.js";
 import { buildApp } from "./server.js";
-import { prisma } from "./lib/prisma.js";
+import { prisma } from "./core/prisma.js";
 
 const app = buildApp();
 

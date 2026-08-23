@@ -174,7 +174,7 @@ model Employee {
 
 // One row per (org, leave code) — e.g. CL/SL/EL. accrualPerMonth is credited
 // to every eligible employee's balance each month, capped at annualCap for
-// the year (see accrueForOrg in src/lib/leaveAccrual.ts).
+// the year (see accrueForOrg in src/modules/leave/accrual.ts).
 model LeaveType {
   id              String  @id @default(cuid())
   organizationId  String
@@ -230,11 +230,11 @@ enum LeaveStatus {
 }
 
 // One row per submitted leave request. workingDays is computed by
-// countWorkingDays (src/lib/workingDays.ts) at submission time and stored —
+// countWorkingDays (src/shared/workingDays.ts) at submission time and stored —
 // it's the amount reserved against the balance while PENDING, and the amount
 // deducted (LeaveBalance.usedDays) on APPROVED. REJECTED/CANCELLED never
 // touch usedDays, since a pending request was only ever reserved, not
-// deducted (see src/lib/leaveRequests.ts).
+// deducted (see src/modules/leave/balances.ts).
 model LeaveRequest {
   id             String @id @default(cuid())
   organizationId String
@@ -242,7 +242,7 @@ model LeaveRequest {
   leaveTypeId    String
 
   // @db.Date: calendar dates, no time-of-day/timezone — see the UTC-only
-  // handling note in src/lib/workingDays.ts.
+  // handling note in src/shared/workingDays.ts.
   startDate   DateTime @db.Date
   endDate     DateTime @db.Date
   isHalfDay   Boolean  @default(false)
@@ -267,7 +267,7 @@ model LeaveRequest {
   @@index([status])
 }
 
-// A company holiday for one org. countWorkingDays (src/lib/workingDays.ts)
+// A company holiday for one org. countWorkingDays (src/shared/workingDays.ts)
 // excludes these alongside weekends, so leave spanning a holiday costs the
 // employee fewer leave days.
 model Holiday {
@@ -308,13 +308,13 @@ enum AttendanceSource {
   // the audit trail separates "HR edited this directly" from "the employee
   // asked and an approver agreed" — both are explicit human decisions and
   // both win over recomputing status from clock times (see
-  // isExplicitHumanDecision in src/lib/attendance.ts).
+  // isExplicitHumanDecision in src/modules/attendance/derivation.ts).
   REGULARIZED
 }
 
 // One row per (employee, day) — only for days something was actually
 // recorded. Days with no row still get a status (WEEK_OFF/HOLIDAY/ON_LEAVE/
-// ABSENT) from deriveDailyStatus (src/lib/attendance.ts); the table is
+// ABSENT) from deriveDailyStatus (src/modules/attendance/derivation.ts); the table is
 // deliberately sparse rather than pre-seeding a row per employee per day.
 model AttendanceRecord {
   id             String @id @default(cuid())

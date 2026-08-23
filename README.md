@@ -20,7 +20,7 @@ npm run dev
 
 The API listens on `http://localhost:4000` by default.
 
-If you ever change `src/lib/auth.ts` (e.g. add a plugin), regenerate the Better Auth Prisma models before migrating:
+If you ever change `src/core/auth.ts` (e.g. add a plugin), regenerate the Better Auth Prisma models before migrating:
 
 ```bash
 npm run auth:generate
@@ -63,40 +63,70 @@ All variables are validated at startup by [src/env.ts](src/env.ts); the process 
 
 ## Layout
 
+**Feature-first.** Cross-cutting infrastructure lives in `core/`, domain
+primitives shared by more than one feature in `shared/`, and each feature owns
+one folder under `modules/` containing its routes, its business operations,
+and its tests. Adding a feature means adding a folder, not touching five.
+
+Inside a module the split is consistent:
+
+- **`*.routes.ts`** — HTTP only: parse with zod, authorize via the guard, call
+  one service function, wrap the result in `ok(...)`.
+- **`*.service.ts`** — the business operations, taking `(prisma, params)`.
+  Every transaction and multi-step rule lives here, so it is testable without
+  HTTP and reusable from a cron or a script.
+- **everything else** — pure domain logic (`derivation.ts`, `orgChart.ts`,
+  `accrual.ts`, …) plus its colocated `*.test.ts`.
+
 ```
-prisma/schema.prisma       Better Auth models (generated) + organization plugin models + Employee (hand-authored)
-prisma.config.ts           Prisma 7 CLI config (migration datasource)
-src/env.ts                 Zod-validated environment, fails fast at boot
-src/lib/prisma.ts          PrismaClient singleton (globalThis-cached in dev) + pg driver adapter
-src/lib/auth.ts            Better Auth config: Prisma adapter, organization + openAPI plugins
-src/lib/email.ts           sendEmail() — Resend, console fallback in dev
-src/lib/registerCompany.ts Shared tenant-bootstrap logic: User -> Organization -> owner Member -> ADMIN Employee -> active org
-src/lib/errors.ts          AppError (statusCode/code/message/details) thrown by routes for known failures
-src/lib/response.ts        ok(data) — wraps a successful payload in the { success: true, data } envelope
-src/lib/orgChart.ts        buildOrgChartTree() — assembles the reporting forest in memory, handles orphans/cycles
-src/lib/leaveTypes.ts      ensureDefaultLeaveTypes() — idempotent CL/SL/EL seeding, called from registerCompany()
-src/lib/leaveAccrual.ts    accrueForOrg() / accrueForAllOrgs() — the monthly accrual engine
-src/lib/workingDays.ts     countWorkingDays() — the ONE place weekend + holiday logic lives
-src/lib/attendance.ts      deriveDailyStatus() — the ONE place attendance/leave/holiday reconciliation lives
-src/lib/holidays.ts        getHolidayDateKeys() — builds the holiday set countWorkingDays takes
-src/lib/leaveRequests.ts   getEffectiveAvailableDays() — the submission-time reservation-balance formula
-src/plugins/auth.ts        Mounts Better Auth's handler at /api/auth/*, decorates request.getSession()
-src/plugins/authGuard.ts   app.requireAuth / app.requireRole([...]) preHandlers; populate request.auth
-src/plugins/errorHandler.ts  Central setErrorHandler — AppError/zod/Prisma errors -> the { success: false, error } envelope
-src/routes/health.ts       GET /health, GET /health/db, GET /me
-src/routes/registerCompany.ts  POST /api/register-company
-src/routes/employees.ts    Employee CRUD + org chart (ADMIN/HR for CRUD, any org member for reads), tenant-scoped
-src/routes/invitations.ts  Invite/accept-link/list/cancel (ADMIN/HR only, tenant-scoped)
-src/routes/leave.ts        GET /leave/*, POST /admin/leave/accrual/run — see "Leave: types, balances & accrual" below
-src/routes/leaveRequests.ts  Submit/list/cancel/approve/reject — see "Leave requests" below
-src/routes/holidays.ts     Holiday calendar CRUD + bulk upload — see "Holiday calendar" below
-src/routes/attendance.ts   Check-in/out, month + day views, HR mark — see "Attendance" below
-src/routes/regularizations.ts  Employee-requested attendance corrections — see "Attendance regularization" below
-src/routes/systemAccrual.ts  POST /system/leave/accrual/run-all — secret-header gated, no session (cron target)
-src/lib/invitations.ts     EmployeeRole <-> org role mapping, accept-URL builder, link-on-accept logic
-src/server.ts              App factory: builds the Fastify instance, registers cors/plugins/routes
-src/index.ts                Boots: validates env, builds the app, listens, handles graceful shutdown
-prisma/seed.ts              Demo company + ADMIN via registerCompany(), idempotent
+prisma/schema.prisma          Better Auth models (generated) + org plugin models + domain models (hand-authored)
+prisma/seed.ts                Demo company + ADMIN via registerCompany(), idempotent
+prisma.config.ts              Prisma 7 CLI config (migration datasource)
+
+src/index.ts                  Boots: validates env, builds the app, listens, handles graceful shutdown
+src/server.ts                 Composition root: builds Fastify, registers cors -> plugins -> error handler -> modules
+src/env.ts                    Zod-validated environment, fails fast at boot
+
+src/core/                     Cross-cutting infrastructure, no feature knowledge
+  prisma.ts                   PrismaClient singleton (globalThis-cached in dev) + pg driver adapter
+  auth.ts                     Better Auth config: Prisma adapter, organization + openAPI plugins
+  email.ts                    sendEmail() — Resend, console fallback in dev
+  errors.ts                   AppError (statusCode/code/message/details) thrown for known failures
+  response.ts                 ok(data) — the { success: true, data } envelope
+  plugins/auth.ts             Mounts Better Auth at /api/auth/*, decorates request.getSession()
+  plugins/authGuard.ts        app.requireAuth / app.requireRole([...]); populate request.auth
+  plugins/errorHandler.ts     Central setErrorHandler — AppError/zod/Prisma -> { success: false, error }
+
+src/shared/                   Domain primitives used by MORE THAN ONE module
+  workingDays.ts              countWorkingDays() — the ONE place weekend + holiday day-counting lives
+
+src/modules/
+  health/health.routes.ts     GET /health, GET /health/db, GET /me
+  identity/
+    registerCompany.ts        Tenant bootstrap: User -> Organization -> owner Member -> ADMIN Employee -> active org
+    registerCompany.routes.ts POST /api/register-company
+    invitations.ts            EmployeeRole <-> org role mapping, accept-URL builder, link-on-accept logic
+    invitations.routes.ts     Invite/accept-link/list/cancel (ADMIN/HR only)
+  employees/
+    orgChart.ts               buildOrgChartTree() — reporting forest in memory, handles orphans/cycles
+    employees.routes.ts       Employee CRUD + org chart
+  leave/
+    leaveTypes.ts             ensureDefaultLeaveTypes() — idempotent CL/SL/EL seeding
+    accrual.ts                accrueForOrg() / accrueForAllOrgs() — the monthly accrual engine
+    balances.ts               getEffectiveAvailableDays() — the submission-time reservation formula
+    leaveRequests.service.ts  submit / cancel / approve / reject — the balance-critical transactions
+    leave.routes.ts           GET /leave/types, /leave/balances/*, POST /admin/leave/accrual/run
+    leaveRequests.routes.ts   /leave/requests/*
+    systemAccrual.routes.ts   POST /system/leave/accrual/run-all — secret-header gated, no session (cron target)
+  holidays/
+    holidays.ts               getHolidayDateKeys() — builds the holiday set countWorkingDays takes
+    holidays.routes.ts        Holiday calendar CRUD + bulk upload
+  attendance/
+    derivation.ts             deriveDailyStatus() — the ONE place attendance/leave/holiday reconciliation lives
+    attendance.service.ts     checkIn / checkOut / markAttendance
+    attendance.routes.ts      Check-in/out, month + day views, HR mark
+    regularizations.service.ts  submit / cancel / list-pending / approve / reject
+    regularizations.routes.ts   Employee-requested attendance corrections
 ```
 
 ## Data model
@@ -174,9 +204,9 @@ Because the Better Auth CLI overwrites `prisma/schema.prisma` wholesale on each 
   field-level tree) and omitted otherwise.
 
 Routes throw `AppError(statusCode, code, message, details?)`
-([src/lib/errors.ts](src/lib/errors.ts)) for known failures, or let a zod
+([src/core/errors.ts](src/core/errors.ts)) for known failures, or let a zod
 `.parse()` / Prisma error bubble up — a single `setErrorHandler`
-([src/plugins/errorHandler.ts](src/plugins/errorHandler.ts)) turns all three
+([src/core/plugins/errorHandler.ts](src/core/plugins/errorHandler.ts)) turns all three
 into the envelope above. Prisma's `P2002` (unique constraint) becomes `409
 CONFLICT` and `P2025` (not found) becomes `404 NOT_FOUND` automatically, so
 routes no longer pre-check things the database already enforces (e.g. the
@@ -184,7 +214,7 @@ routes no longer pre-check things the database already enforces (e.g. the
 
 ## Auth guard
 
-`src/plugins/authGuard.ts` adds two preHandlers, used as route options
+`src/core/plugins/authGuard.ts` adds two preHandlers, used as route options
 (`{ preHandler: app.requireRole([...]) }`):
 
 - `app.requireAuth` — session must be valid (401), must have an active org on
@@ -247,9 +277,9 @@ route.
 
 ## Email & password reset
 
-`src/lib/email.ts` wraps [Resend](https://resend.com) behind a single `sendEmail({ to, subject, html })`
+`src/core/email.ts` wraps [Resend](https://resend.com) behind a single `sendEmail({ to, subject, html })`
 function — nothing else in the codebase should call the Resend SDK directly.
-`src/lib/auth.ts` uses it for Better Auth's `sendResetPassword` and
+`src/core/auth.ts` uses it for Better Auth's `sendResetPassword` and
 `sendVerificationEmail` hooks.
 
 **Testing the reset flow locally** (no Resend account needed): leave
@@ -267,7 +297,7 @@ needed, just the env var (the frontend also needs a page to land users on
 after they click the verification link, which is out of scope here).
 
 **Rate limiting** on auth endpoints is handled by Better Auth's built-in
-limiter (see the comment in `src/lib/auth.ts`) rather than a separate
+limiter (see the comment in `src/core/auth.ts`) rather than a separate
 package — it already ships tighter windows for sign-in/sign-up and
 password-reset/verification requests than its general default.
 
@@ -276,7 +306,7 @@ password-reset/verification requests than its general default.
 `POST /api/register-company` bootstraps a new tenant: it creates the Better
 Auth `User`, the `Organization`, an `owner` `Member`, the domain `Employee`
 (`role: ADMIN`), and sets that organization active on the new session — all
-via the shared `registerCompany()` helper in `src/lib/registerCompany.ts` (also
+via the shared `registerCompany()` helper in `src/modules/identity/registerCompany.ts` (also
 used by the seed script). Employees themselves are invite-only and are not
 created by this endpoint; it only exists to create the *first* admin for a
 brand-new company.
@@ -297,7 +327,7 @@ curl -X POST http://localhost:4000/api/register-company \
 
 Signed-in users cannot self-service create additional organizations through
 Better Auth's own `/api/auth/organization/create` endpoint
-(`allowUserToCreateOrganization: false` in `src/lib/auth.ts`) — this endpoint
+(`allowUserToCreateOrganization: false` in `src/core/auth.ts`) — this endpoint
 is the only path that creates an org, because it's the only path that also
 creates the required `Employee` row.
 
@@ -308,7 +338,7 @@ registration ever 500s.
 
 ## Employee CRUD
 
-All four endpoints (`src/routes/employees.ts`) share one gate:
+All four endpoints (`src/modules/employees/employees.routes.ts`) share one gate:
 `app.requireRole(["ADMIN", "HR"])` (see "Auth guard" above) — otherwise
 401/403. Every query/mutation is scoped to `request.auth.organizationId`; it
 is never read from the request body.
@@ -333,7 +363,7 @@ is never read from the request body.
 ## Org chart
 
 `GET /api/employees/org-chart` and `GET /api/employees/:id/reports`
-(`src/routes/employees.ts`, tree assembly in `src/lib/orgChart.ts`) are gated
+(`src/modules/employees/employees.routes.ts`, tree assembly in `src/modules/employees/orgChart.ts`) are gated
 by `app.requireAuth` only — any authenticated member of the org can view
 them, unlike the ADMIN/HR-only CRUD above.
 
@@ -352,7 +382,7 @@ Node[]`.
   /api/employees/:id` guards against on write, see above) can't recurse
   forever: each employee is attached to the tree at most once, so the second
   time a cycle is walked into it's skipped with a warning instead of looping.
-  See `src/lib/orgChart.test.ts` for the multi-root/orphan/cycle cases.
+  See `src/modules/employees/orgChart.test.ts` for the multi-root/orphan/cycle cases.
 - `GET /api/employees/:id/reports` — `data: { reports: Node[] }`, direct
   reports only (not the whole subtree), tenant-scoped, ordered by `fullName`.
   404 if `:id` doesn't resolve to an `Employee` in the caller's org.
@@ -372,7 +402,7 @@ Accrual itself is month-based, not day-based, so it doesn't use
 being counted, which is the request lifecycle below.
 
 **Default leave types.** `ensureDefaultLeaveTypes()`
-([src/lib/leaveTypes.ts](src/lib/leaveTypes.ts)) upserts CL (1/mo, cap 12),
+([src/modules/leave/leaveTypes.ts](src/modules/leave/leaveTypes.ts)) upserts CL (1/mo, cap 12),
 SL (1/mo, cap 12), EL (1.5/mo, cap 18) for an org, keyed on the
 `organizationId_code` unique constraint — `update: {}` on conflict, so
 calling it again (or for an org that already has them) never clobbers an
@@ -382,7 +412,7 @@ same rollback that already covers a failed `Employee` create (delete the
 just-created `Organization`/`User`) applies here too.
 
 **The accrual engine** — `accrueForOrg(organizationId, year, month)`
-([src/lib/leaveAccrual.ts](src/lib/leaveAccrual.ts)):
+([src/modules/leave/accrual.ts](src/modules/leave/accrual.ts)):
 
 1. One query for every `Employee` in the org, one for every active
    `LeaveType` with `accrualPerMonth > 0` — no per-employee/per-type
@@ -402,7 +432,7 @@ just-created `Organization`/`User`) applies here too.
 
 `accrueForAllOrgs(year, month)` just loops every `Organization` through
 `accrueForOrg` — used by the system endpoint below. Both are exercised by
-[src/lib/leaveAccrual.test.ts](src/lib/leaveAccrual.test.ts) (idempotency +
+[src/modules/leave/accrual.test.ts](src/modules/leave/accrual.test.ts) (idempotency +
 cap, against disposable data in the real dev DB — this is a balance-critical
 path, not something to leave unverified).
 
@@ -448,19 +478,19 @@ org can approve or reject **any** pending request — flexible routing, not
 strict manager-of-record (locked decision for this stage).
 
 **`countWorkingDays(startDate, endDate, isHalfDay, holidayDateKeys?)`**
-([src/lib/workingDays.ts](src/lib/workingDays.ts)) is the **one and only**
+([src/shared/workingDays.ts](src/shared/workingDays.ts)) is the **one and only**
 place day-counting/weekend/holiday logic lives in the whole codebase — every
 balance calculation that counts days routes through it. It excludes Sat/Sun
 **and** any injected company holidays, and returns `0.5` for a
 (single-day-only) half day. Dates are handled in UTC throughout (matches how
 Prisma round-trips the `@db.Date` columns), so day-of-week doesn't drift with
 the server's local timezone. Verified by
-[src/lib/workingDays.test.ts](src/lib/workingDays.test.ts).
+[src/shared/workingDays.test.ts](src/shared/workingDays.test.ts).
 
 Holidays are **injected, not queried inside** — the function stays pure and
 synchronous, so it's testable without a database and does no hidden I/O.
 Callers build the set first with `getHolidayDateKeys(db, organizationId,
-startDate, endDate)` ([src/lib/holidays.ts](src/lib/holidays.ts)), which
+startDate, endDate)` ([src/modules/holidays/holidays.ts](src/modules/holidays/holidays.ts)), which
 pairs the tenant-scoped query with the same `toUtcDateKey` formatting the
 counter looks up — that pairing is why the key format can't silently drift
 apart (a real failure mode, covered by a DB round-trip test in
@@ -472,7 +502,7 @@ different:**
 - **Submission** (`POST /leave/requests`) uses the *effective available*
   formula — `accruedDays - usedDays - (this employee's own PENDING requests
   for the same leave type/year)` — via `getEffectiveAvailableDays`
-  ([src/lib/leaveRequests.ts](src/lib/leaveRequests.ts),
+  ([src/modules/leave/balances.ts](src/modules/leave/balances.ts),
   tested in `leaveRequests.test.ts`). Subtracting pending reservations is
   what stops two overlapping/oversized pending submits from both fitting
   under the same real balance — a `PENDING` request reserves but never
@@ -495,7 +525,7 @@ simultaneous callers each passing the check before either commits. Both run
 inside a `Serializable` Prisma transaction instead, so Postgres aborts one
 side of any real conflict rather than letting both apply — surfaced by the
 central error handler as `409 CONFLICT` (Prisma error `P2034`, "please
-retry"; see [src/plugins/errorHandler.ts](src/plugins/errorHandler.ts)).
+retry"; see [src/core/plugins/errorHandler.ts](src/core/plugins/errorHandler.ts)).
 Approval's status check (`still PENDING?`) is re-verified inside that same
 transaction, so a request already decided by someone else cleanly 409s
 instead of double-applying.
@@ -522,13 +552,13 @@ instead of double-applying.
   `{ decisionNote? }`. Both 404 if the request isn't in the caller's org,
   409 if it's no longer `PENDING`. **Self-approval is allowed** (any
   approver-role employee, including the requester themselves if they hold
-  `MANAGER`/`HR`/`ADMIN`) — `src/routes/leaveRequests.ts` has a `TODO`
+  `MANAGER`/`HR`/`ADMIN`) — `src/modules/leave/leaveRequests.service.ts` has a `TODO`
   flagging this as a policy option to revisit once approval routing gets
   stricter than "any approver role in the org".
 
 ## Holiday calendar
 
-Per-org company holidays ([src/routes/holidays.ts](src/routes/holidays.ts)),
+Per-org company holidays ([src/modules/holidays/holidays.routes.ts](src/modules/holidays/holidays.routes.ts)),
 excluded from leave day-counting alongside weekends — leave spanning a
 holiday costs the employee fewer leave days. Management is ADMIN/HR only;
 **reading is open to any org member**, since everyone needs to see the
@@ -568,16 +598,16 @@ and is rejected by the existing "no working days" rule.
 
 ## Attendance
 
-Self check-in/out plus HR marking ([src/routes/attendance.ts](src/routes/attendance.ts)),
+Self check-in/out plus HR marking ([src/modules/attendance/attendance.routes.ts](src/modules/attendance/attendance.routes.ts)),
 reconciled against leave, holidays and weekends by one isolated function.
 For employee-initiated corrections see "Attendance regularization" below.
 
-**`deriveDailyStatus(...)`** ([src/lib/attendance.ts](src/lib/attendance.ts))
+**`deriveDailyStatus(...)`** ([src/modules/attendance/derivation.ts](src/modules/attendance/derivation.ts))
 is **THE ONE PLACE** attendance/leave/holiday/weekend reconciliation lives —
 the attendance counterpart to `countWorkingDays`. Nothing else decides what a
 given day "is"; every view (self month, HR day, HR month) *and* the check-in
 guard route through it, so they cannot disagree. It reuses `isWeekend` from
-[src/lib/workingDays.ts](src/lib/workingDays.ts) rather than re-deriving the
+[src/shared/workingDays.ts](src/shared/workingDays.ts) rather than re-deriving the
 weekend rule.
 
 Priority order — first match wins:
@@ -644,7 +674,7 @@ counts as `PRESENT`, not a half day — the day is still open.
 ## Attendance regularization
 
 Employee-initiated attendance corrections
-([src/routes/regularizations.ts](src/routes/regularizations.ts)): the
+([src/modules/attendance/regularizations.service.ts](src/modules/attendance/regularizations.service.ts)): the
 employee asks, any MANAGER/HR/ADMIN decides, and an approval applies the
 correction to the `AttendanceRecord`.
 
@@ -722,7 +752,7 @@ mapping.
   decision fields; no record change.
 
 **Self-approval is allowed** for now (an approver-role employee can approve
-their own regularization) — `src/routes/regularizations.ts` carries a `TODO`
+their own regularization) — `src/modules/attendance/regularizations.service.ts` carries a `TODO`
 flagging it as a policy option, matching the same open question on leave
 approvals.
 
@@ -734,7 +764,7 @@ already created.
 
 **Custom org roles.** Better Auth's organization plugin gets four custom
 roles mirroring `EmployeeRole` lowercased (`admin`, `hr`, `manager`,
-`employee` — defined in `src/lib/auth.ts` via `defaultAc.newRole(...)`), so
+`employee` — defined in `src/core/auth.ts` via `defaultAc.newRole(...)`), so
 an invited employee's Better Auth org role carries their `EmployeeRole`
 through. Only `admin` and `hr` get `invitation: ["create", "cancel"]`,
 matching the ADMIN/HR-only gate on these routes. `owner` (whoever ran
@@ -772,7 +802,7 @@ bit us during testing — worth knowing if you ever touch the `roles` config.)
      -d '{"invitationId":"<invitationId>"}'
    ```
 4. On accept, `organizationHooks.afterAcceptInvitation`
-   (`src/lib/invitations.ts` → `linkEmployeeOnAcceptInvitation`) finds the
+   (`src/modules/identity/invitations.ts` → `linkEmployeeOnAcceptInvitation`) finds the
    `Employee` by `(organizationId, email)` and sets `userId` on that *same*
    record — no new `Employee` is created. It also force-sets
    `activeOrganizationId` on the accepting user's session(s) directly via
@@ -814,5 +844,5 @@ automatically after `prisma migrate dev` (wired via `migrations.seed` in
 
 - Prisma 7 requires a driver adapter — the connection string reaches `PrismaClient` through `@prisma/adapter-pg`, not through `schema.prisma`. Migration commands read it from `prisma.config.ts`.
 - The generated client lands in `src/generated/prisma` and is gitignored; `npm run build` / `npm run db:generate` regenerate it.
-- `request.getSession()` (declared via module augmentation in [src/plugins/auth.ts](src/plugins/auth.ts)) reads the session from request headers via Better Auth's `auth.api.getSession`. Use it in any route that needs to know the caller's identity.
+- `request.getSession()` (declared via module augmentation in [src/core/plugins/auth.ts](src/core/plugins/auth.ts)) reads the session from request headers via Better Auth's `auth.api.getSession`. Use it in any route that needs to know the caller's identity.
 - CORS is locked to the single `FRONTEND_ORIGIN` with `credentials: true`, required for Better Auth's cookie-based sessions to work cross-origin.
